@@ -47,4 +47,43 @@ cargo build --release
 
 # 6. Запуск видео-обоев (H.264 / HEVC / VP9 / AV1) через нативный ffmpeg-next + VA-API
 ./target/release/rwallpprs set-video ~/Videos/wallpaper_av1.mp4 --hw-accel vaapi --fps 60
+
+# 7. Порт экранной заставки Android 17 Easter Egg «Landroid» (examples/niri-landroid):
+#    корабль летает по вселенной на автопилоте (полностью на GPU/wgpu).
+./target/release/rwallpprs set-bin ./target/release/niri-landroid --mode animated --fps 60
 ```
+
+## Пример `niri-landroid` (порт Android 17 Easter Egg «Landroid»)
+
+`examples/niri-landroid` — полный порт экранной заставки (DreamService) Android 17 Easter Egg:
+корабль Landroid летает по процедурной вселенной на автопилоте, камера следует за ним
+(dynamic zoom), как в `DreamUniverse`/`MainActivity.Spaaaaace`. Перенесены и симуляция
+(`Physics.kt`, `Universe.kt`, `Autopilot.kt`: gravity, посадки/посадочные констрейнты, трек,
+искры выхлопа, ringfence), и рендер `VisibleUniverse.kt` (поля гравитации, венцы звезды,
+диски/обводки/текстуры планет, орбиты, пунктирный `Container`, флаг посадки, оверлей
+автопилота, трек). Вся графика — один инстансный SDF-пайплайн `wgpu` + CPU-триангулированный
+полигон корабля.
+
+Сид вселенной задаётся так (порядок приоритета): аргумент `--seed N` → переменная окружения
+`RWALLPPRS_SEED=N` → dailySeed (`год*10000 + месяц*100 + день` по UTC, как `randomSeed()` в
+оригинале). Один и тот же сид даёт бит-в-бит одинаковую вселенную, что удобно для проверок:
+
+```bash
+./target/release/niri-landroid --seed 12345                     # обычный режим (его запускает демон через SHM)
+RWALLPPRS_SELFTEST=1200 RWALLPPRS_DUMP_PPM=/tmp/f.ppm \
+    ./target/release/niri-landroid --seed 12345                 # self-test: N кадров + PPM-дамп
+RWALLPPRS_STATS=1 ./target/release/niri-landroid --seed 12345    # телеметрия по кадрам в stderr
+RWALLPPRS_DEBUG_SHIP_R=190000 ./target/release/niri-landroid --seed 12345  # корабль у ringfence (диагностика)
+```
+
+**Точность и производительность.** Рендер сверен с исходниками кадра за кадром: порядок
+отрисовки (сетка → constraints → звезда → планеты/искры → автопилот → корабль → трек),
+штриховка линий в экранных пикселях (`1/zoom`, `2/zoom`, `3/zoom`), пунктир ringfence 8/8
+экранных px независимо от зума, формулы полей гравитации, венцов звезды, текстур планет и
+оверлея автопилота. Невидимые объекты, искры и сегменты трека отсекаются по расширенному на
+10 % кадру — отсечение консервативно (тонкие окружности и огромные кольца проверяются на
+пересечение с кадром, а не по своему центру), поэтому картинка не меняется (проверено
+попиксельным диффом с отсечением и без: 0 различающихся пикселей на разных сценах), а время
+кадра падает примерно вдвое: на 1920×1080 в self-test ~3.3 мс/кадр с отсечением против
+~6.5 мс/кадр без него (медиана из 3 парных прогонов по 1200 кадров, Vulkan; абсолютные
+значения зависят от нагрузки на GPU).

@@ -2,6 +2,8 @@
 //!
 //! Специальное API для написания обоев под композитор **Niri** на чистом **Rust**:
 //! - **На GPU (`wgpu` + WGSL шейдеры)**: через типаж [`GpuShaderWallpaper`] и макрос [`run_shader_wallpaper!`].
+//! - **На GPU (полноценные 2D-сцены)**: через типаж [`GpuSceneWallpaper`], контекст [`GpuScene`]
+//!   и макрос [`run_scene_wallpaper!`] — собственные пайплайны, буферы, инстансинг.
 //! - **На CPU (`Canvas` zero-copy SHM)**: через типаж [`Wallpaper`] и макрос [`run_wallpaper!`].
 //! - Все операции с разделяемой памятью (`RWALLPPRS_SHM_FD`) используют безопасные обертки [`rustix::mm::mmap`].
 
@@ -9,7 +11,8 @@ pub mod wgpu_renderer;
 
 pub use rwallpprs_ipc::{NiriViewportState, RustWallpaperMode, WorkerAck, WorkerEvent};
 pub use wgpu_renderer::{
-    GpuShaderWallpaper, NiriShaderUniforms, ShaderWallpaperAdapter, WgpuHeadlessPipeline,
+    GpuScene, GpuSceneWallpaper, GpuShaderWallpaper, NiriShaderUniforms, SceneWallpaperAdapter,
+    ShaderWallpaperAdapter, WgpuHeadlessPipeline, SCENE_TARGET_FORMAT,
 };
 
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
@@ -355,6 +358,19 @@ macro_rules! run_shader_wallpaper {
     ($shader_wallpaper_type:ty) => {
         fn main() -> anyhow::Result<()> {
             $crate::run_wallpaper_loop::<$crate::ShaderWallpaperAdapter<$shader_wallpaper_type>>()
+        }
+    };
+}
+
+/// Макрос для запуска сценовых WGPU-обоев, реализующих [`GpuSceneWallpaper`].
+///
+/// Даёт обоям полноценный `wgpu::Device` / `Queue` / `CommandEncoder` для собственных
+/// пайплайнов, буферов и инстансинга, с автоматическим readback'ом готового кадра в [`Canvas`].
+#[macro_export]
+macro_rules! run_scene_wallpaper {
+    ($scene_wallpaper_type:ty) => {
+        fn main() -> anyhow::Result<()> {
+            $crate::run_wallpaper_loop::<$crate::SceneWallpaperAdapter<$scene_wallpaper_type>>()
         }
     };
 }

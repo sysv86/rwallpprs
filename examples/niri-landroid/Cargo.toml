@@ -1,0 +1,17 @@
+[package]
+name = "niri-landroid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WGPU (Vulkan/GL) порт экранной заставки Android 17 Easter Egg «Landroid»: корабль летает по вселенной на автопилоте"
+
+[[bin]]
+name = "niri-landroid"
+path = "src/main.rs"
+
+[dependencies]
+rwallpprs-sdk = { path = "../../crates/rwallpprs-sdk" }
+anyhow.workspace = true
+bytemuck.workspace = true
+# Нужен напрямую: сценовый API SDK отдаёт сырые типы wgpu::Device/Queue/CommandEncoder.
+wgpu.workspace = true

@@ -6,6 +6,7 @@ members = [
     "crates/rwallpprs-daemon",
     "crates/rwallpprs-cli",
     "examples/niri-cyber-grid",
+    "examples/niri-landroid",
     "examples/niri-voronoi-flow",
     "examples/minimal-arch-static",
 ]
