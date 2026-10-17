@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use rustix::{
-    fd::{AsRawFd, OwnedFd},
+    fd::{AsRawFd, OwnedFd, RawFd},
     fs::{fcntl_getfd, fcntl_setfd, ftruncate, memfd_create, FdFlags, MemfdFlags},
     mm::{mmap, munmap, MapFlags, ProtFlags},
 };
@@ -205,6 +205,20 @@ impl RustWallpaperRunner {
         self.child.id()
     }
 
+    /// Raw FD `memfd` кадрового буфера движка (zero-copy direct present поверх
+    /// того же файла: демон импортирует его в `wl_shm` без копий пикселей).
+    /// Runner всегда владеет этим memfd, поэтому `RawFd` без `Option`.
+    pub fn shm_raw_fd(&self) -> RawFd {
+        self.shm_fd.as_raw_fd()
+    }
+
+    /// Слот, который будет использован для **следующего** кадра — без продвижения
+    /// `current_slot`. Нужен flow-control'у главного цикла: перед отправкой
+    /// `RenderFrame` проверяется, освободил ли композитор этот слот.
+    pub fn peek_next_slot(&self) -> u8 {
+        self.current_slot
+    }
+
     pub fn should_render_reactive(&mut self, niri: &NiriViewportState) -> bool {
         if self.frame_index == 0 {
             self.last_niri_snapshot = Some(niri.clone());
@@ -225,7 +239,7 @@ impl RustWallpaperRunner {
         }
     }
 
-    pub fn request_frame(&mut self, niri: NiriViewportState) -> Result<Option<&[u8]>> {
+    pub fn request_frame(&mut self, niri: NiriViewportState) -> Result<Option<(u8, &[u8])>> {
         if self.suspended {
             return Ok(None);
         }
@@ -272,7 +286,9 @@ impl RustWallpaperRunner {
                 let frame_slice = unsafe {
                     std::slice::from_raw_parts(self.shm_ptr.as_ptr().add(offset), byte_len)
                 };
-                Ok(Some(frame_slice))
+                // Возвращаем слот вместе со срезом: direct-present привязывает
+                // wl_buffer к этому же офсету (нулевое копирование через SHM)
+                Ok(Some((slot, frame_slice)))
             }
             WorkerAck::FrameSkipped { .. } => Ok(None),
         }

@@ -26,7 +26,7 @@ use rwallpprs_ipc::{HwAccelBackend, ScaleMode, VideoCodec};
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::ptr;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub struct VideoWallpaperEngine {
     pub path: PathBuf,
@@ -46,6 +46,8 @@ pub struct VideoWallpaperEngine {
     decoded_frame: VideoFrame,
     sw_transfer_frame: VideoFrame,
     scaled_bgra_frame: VideoFrame,
+    /// Уже отправляли decoder.send_eof() — drain проделан, вход исчерпан.
+    eof_flushed: bool,
 }
 
 unsafe impl Send for VideoWallpaperEngine {}
@@ -128,6 +130,7 @@ impl VideoWallpaperEngine {
             decoded_frame: VideoFrame::empty(),
             sw_transfer_frame: VideoFrame::empty(),
             scaled_bgra_frame: VideoFrame::new(Pixel::BGRA, width, height),
+            eof_flushed: false,
         })
     }
 
@@ -238,16 +241,34 @@ impl VideoWallpaperEngine {
                 }
             }
 
-            // 3. Если достигнут конец файла (EOF) — делаем бесшовный seek в начало
+            // 3. Если достигнут конец файла — сливаем хвост декодера и
+            //    пересоздаём вход+декодер целиком. Практика показала, что
+            //    `Input::seek(0, ..0)` в ffmpeg-next 9 после EOF возвращает
+            //    Ok, но пайплайн декодера остаётся мёртвым — поэтому
+            //    guarantee только один: свежий контейнер и свежий декодер.
             if !packet_fed {
-                self.decoder.send_eof()?;
-                if self.decoder.receive_frame(&mut self.decoded_frame).is_ok() {
-                    self.convert_decoded_frame_to_bgra(dest_bgra)?;
-                    return Ok(true);
+                if !self.eof_flushed {
+                    self.decoder.send_eof()?;
+                    self.eof_flushed = true;
+                    // Один кадр из drain-буфера декодера отдаем на этом же тике,
+                    // чтобы не мигало на месте стыка лупа
+                    if self.decoder.receive_frame(&mut self.decoded_frame).is_ok() {
+                        self.convert_decoded_frame_to_bgra(dest_bgra)?;
+                        return Ok(true);
+                    }
                 }
-                debug!("Достигнут конец видеопотока, бесшовный перезапуск с 0-й секунды");
-                self.ictx.seek(0, ..0)?;
-                self.decoder.flush();
+                // Вход исчерпан, декодер выдохся — перезапуск движка (луп видео)
+                let old_paused = self.paused;
+                *self = VideoWallpaperEngine::new(
+                    self.path.clone(),
+                    self.hw_accel,
+                    self.scale_mode,
+                    self.target_fps,
+                    self.width,
+                    self.height,
+                )?;
+                self.paused = old_paused;
+                continue;
             }
         }
     }
