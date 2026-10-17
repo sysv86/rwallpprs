@@ -204,6 +204,13 @@ impl NiriMonitor {
         let mut has_fullscreen = false;
         let mut focused_width_ratio = 0.0f32;
 
+        // Покрытие экрана считаем по колонкам ленты Niri: ширина колонки —
+        // это максимальная ширина окна в ней (стопки окон делят одну колонку).
+        // Сумма ширин колонок, отнесённая к ширине монитора, корректно описывает
+        // и одно окно на весь экран, и 2-3 окна, вместе занимающие весь экран.
+        let mut column_widths: HashMap<usize, f32> = HashMap::new();
+        let mut no_layout_width = 0.0f32;
+
         for win in windows.values() {
             if win.workspace_id == Some(active_ws_id) || active_ws_id == 0 {
                 count_on_ws += 1;
@@ -215,6 +222,17 @@ impl NiriMonitor {
                     has_fullscreen = true;
                 }
 
+                // Плавающие окна не тайлятся в колонки — учитываем их отдельно,
+                // чтобы они не «склеивались» в одну колонку с тайлом по row-индексу.
+                if win.is_floating {
+                    no_layout_width = no_layout_width.max(tile_w.min(out_w as f32));
+                } else if let Some((col_idx, _row_idx)) = win.layout.pos_in_scrolling_layout {
+                    let entry = column_widths.entry(col_idx).or_insert(0.0);
+                    *entry = entry.max(tile_w);
+                } else {
+                    no_layout_width = no_layout_width.max(tile_w.min(out_w as f32));
+                }
+
                 if win.is_focused {
                     focused_width_ratio = (tile_w / (out_w.max(1) as f32)).clamp(0.0, 1.0);
                     if let Some((col_idx, _row_idx)) = win.layout.pos_in_scrolling_layout {
@@ -224,8 +242,14 @@ impl NiriMonitor {
             }
         }
 
+        // Колонки ленты идут вплотную: если сумма их ширин покрывает монитор,
+        // обои не видны ни при каком горизонтальном скролле.
+        let cols_total: f32 = column_widths.values().copied().sum::<f32>() + no_layout_width;
+        let screen_coverage_ratio = (cols_total / (out_w.max(1) as f32)).clamp(0.0, 1.0);
+
         guard.visible_windows_count = count_on_ws;
         guard.has_fullscreen_window = has_fullscreen;
         guard.focused_window_width_ratio = focused_width_ratio;
+        guard.screen_coverage_ratio = screen_coverage_ratio;
     }
 }

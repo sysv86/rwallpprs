@@ -66,10 +66,11 @@ impl PowerManager {
 
         if self.policy.pause_on_maximized_column
             && !niri.overview_open
-            && niri.focused_window_width_ratio >= self.policy.maximized_column_threshold
+            && (niri.screen_coverage_ratio >= self.policy.maximized_column_threshold
+                || niri.focused_window_width_ratio >= self.policy.maximized_column_threshold)
         {
             return PowerRuntimeState::HiddenOccluded {
-                reason: "niri_maximized_column".into(),
+                reason: "niri_screen_fully_covered".into(),
             };
         }
 

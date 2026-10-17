@@ -390,12 +390,13 @@ fn print_response(resp: ControlResponse) {
             println!("Активный источник   : {}", st.active_source);
             println!("Состояние рендера   : {:?}", st.power_state);
             println!(
-                "Niri Viewport       : workspace=#{} (id={}), overview={}, fullscreen={}, width_ratio={:.2}, scroll={:.1}",
+                "Niri Viewport       : workspace=#{} (id={}), overview={}, fullscreen={}, focused_ratio={:.2}, screen_coverage={:.2}, scroll={:.1}",
                 st.niri_state.active_workspace_idx,
                 st.niri_state.active_workspace_id,
                 st.niri_state.overview_open,
                 st.niri_state.has_fullscreen_window,
                 st.niri_state.focused_window_width_ratio,
+                st.niri_state.screen_coverage_ratio,
                 st.niri_state.strip_scroll_offset
             );
             println!(
