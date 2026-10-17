@@ -1,0 +1,18 @@
+[package]
+name = "rwallpprs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI controller and self-contained ELF binary bundler for RWallpprs on Niri"
+
+[[bin]]
+name = "rwallpprs"
+path = "src/main.rs"
+
+[dependencies]
+rwallpprs-ipc = { path = "../rwallpprs-ipc" }
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+anyhow.workspace = true
+clap.workspace = true

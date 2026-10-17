@@ -1,0 +1,17 @@
+[Unit]
+Description=RWallpprs v0.2.0-beta.1 — Video & Native Rust Wallpaper Daemon for Niri
+Documentation=https://github.com/rwallpprs/rwallpprs
+PartOf=graphical-session.target
+After=graphical-session.target niri.service
+ConditionEnvironment=WAYLAND_DISPLAY
+ConditionEnvironment=NIRI_SOCKET
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rwallpprs-daemon --config %E/rwallpprs/rwallpprs.toml
+Restart=on-failure
+RestartSec=1
+Slice=background-graphical.slice
+
+[Install]
+WantedBy=niri.service

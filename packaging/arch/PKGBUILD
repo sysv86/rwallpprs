@@ -1,0 +1,38 @@
+# Maintainer: RWallpprs Team <maintainers@rwallpprs.local>
+pkgname=rwallpprs
+pkgver=0.2.0_beta.1
+pkgrel=1
+pkgdesc="Native Rust Video (ffmpeg-next VA-API/Vulkan H.264/HEVC/AV1) & GPU/CPU Wallpaper Engine for Niri"
+arch=('x86_64')
+url="https://github.com/rwallpprs/rwallpprs"
+license=('MIT')
+depends=('wayland' 'ffmpeg' 'libva' 'vulkan-icd-loader' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'clang' 'pkgconf' 'wayland-protocols')
+optdepends=(
+    'niri: Scrollable-tiling Wayland compositor integration via NIRI_SOCKET'
+    'libva-mesa-driver: VA-API hardware decoding on AMD/Intel GPUs'
+    'intel-media-driver: VA-API hardware decoding on Intel Gen9+ GPUs'
+    'vulkan-radeon: Vulkan WGPU shader execution on AMD GPUs'
+    'vulkan-intel: Vulkan WGPU shader execution on Intel GPUs'
+)
+source=()
+sha256sums=()
+
+build() {
+    cd "$startdir/../.."
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --all-targets
+}
+
+package() {
+    cd "$startdir/../.."
+    install -Dm755 "target/release/rwallpprs" "$pkgdir/usr/bin/rwallpprs"
+    install -Dm755 "target/release/rwallpprs-daemon" "$pkgdir/usr/bin/rwallpprs-daemon"
+
+    install -Dm755 "target/release/niri-cyber-grid" "$pkgdir/usr/lib/rwallpprs/wallpapers/niri-cyber-grid"
+    install -Dm755 "target/release/niri-voronoi-flow" "$pkgdir/usr/lib/rwallpprs/wallpapers/niri-voronoi-flow"
+    install -Dm755 "target/release/minimal-arch-static" "$pkgdir/usr/lib/rwallpprs/wallpapers/minimal-arch-static"
+
+    install -Dm644 "config/rwallpprs.toml" "$pkgdir/etc/xdg/rwallpprs/rwallpprs.toml"
+    install -Dm644 "packaging/systemd/rwallpprs.service" "$pkgdir/usr/lib/systemd/user/rwallpprs.service"
+}

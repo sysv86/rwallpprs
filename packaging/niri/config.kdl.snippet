@@ -1,0 +1,14 @@
+// Фрагмент для ~/.config/niri/config.kdl
+spawn-at-startup "rwallpprs" "daemon"
+spawn-at-startup "rwallpprs" "set-bin" "/usr/lib/rwallpprs/wallpapers/niri-cyber-grid" "--mode" "animated" "--fps" "60"
+
+layout {
+    background-color "transparent"
+}
+
+binds {
+    Mod+Shift+W { spawn "rwallpprs" "power" "--toggle-pause"; }
+    Mod+Alt+1   { spawn "rwallpprs" "set-bin" "/usr/lib/rwallpprs/wallpapers/niri-cyber-grid"; }
+    Mod+Alt+2   { spawn "rwallpprs" "set-bin" "/usr/lib/rwallpprs/wallpapers/niri-voronoi-flow"; }
+    Mod+Alt+3   { spawn "rwallpprs" "set-bin" "/usr/lib/rwallpprs/wallpapers/minimal-arch-static" "--mode" "static"; }
+}

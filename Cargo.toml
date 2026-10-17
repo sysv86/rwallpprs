@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rwallpprs-ipc",
+    "crates/rwallpprs-sdk",
+    "crates/rwallpprs-daemon",
+    "crates/rwallpprs-cli",
+    "examples/niri-cyber-grid",
+    "examples/niri-voronoi-flow",
+    "examples/minimal-arch-static",
+]
+
+[workspace.package]
+version = "0.2.0-beta.1"
+edition = "2021"
+license = "MIT"
+authors = ["RWallpprs Contributors"]
+repository = "https://github.com/rwallpprs/rwallpprs"
+description = "Native Rust Video (ffmpeg-next VA-API/Vulkan H.264/HEVC/AV1/VP9) & GPU/CPU Wallpaper Engine for Niri on Arch Linux"
+
+[workspace.dependencies]
+# Serialization & CLI
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+toml = "0.8"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+
+# Safe POSIX Syscalls (memfd_create, mmap, signals, fcntl)
+rustix = { version = "0.38", features = ["fs", "mm", "shm", "process", "stdio"] }
+
+# Official Niri Compositor IPC crate
+niri-ipc = "26.4.0"
+
+# Multimedia: Native Rust FFmpeg bindings (libavformat, libavcodec, libswscale, libavutil + HWAccel)
+ffmpeg-next = { version = "9.0", default-features = false, features = ["format", "codec", "software-scaling", "filter"] }
+ffmpeg-sys-next = "9.0"
+
+# GPU Rendering for Native Rust Wallpapers (Vulkan / GL via wgpu)
+wgpu = "24.0"
+pollster = "0.4"
+bytemuck = { version = "1.18", features = ["derive"] }
+
+# Wayland Client & wlr-layer-shell
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+smithay-client-toolkit = "0.19"

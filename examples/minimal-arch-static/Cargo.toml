@@ -1,0 +1,14 @@
+[package]
+name = "minimal-arch-static"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-CPU static procedural geometric wallpaper written in Rust for Niri on Arch Linux"
+
+[[bin]]
+name = "minimal-arch-static"
+path = "src/main.rs"
+
+[dependencies]
+rwallpprs-sdk = { path = "../../crates/rwallpprs-sdk" }
+anyhow.workspace = true

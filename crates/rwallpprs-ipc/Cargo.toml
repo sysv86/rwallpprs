@@ -1,0 +1,12 @@
+[package]
+name = "rwallpprs-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IPC protocol, shared memory double-buffer layout, and Niri viewport state for RWallpprs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
