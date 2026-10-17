@@ -22,7 +22,7 @@ use rustix::{
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use video_engine::VideoWallpaperEngine;
 use wayland_layer::WaylandLayerContext;
 
@@ -154,18 +154,44 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         }
 
         // 2. Диспетчеризация событий Wayland и отслеживание смены разрешения монитора
+        let mut wl_dead = false;
         if let Some((ref conn, ref mut queue, ref mut wl_ctx)) = wayland_session {
             // roundtrip читает входящие ответы композитора (включая wl_buffer.release),
             // иначе SlotPool не освобождает слоты и память утекает OOM-сессию
             let _ = conn.flush();
-            let _ = queue.roundtrip(wl_ctx);
-            if wl_ctx.resolution_changed {
+            if let Err(e) = queue.roundtrip(wl_ctx) {
+                // Фатальная ошибка протокола (клиент отсоединён композитором):
+                // переинициализируем Wayland-сессию целиком в следующем такте
+                error!("Соединение Wayland прервано ({}), запланировано переподключение", e);
+                wl_dead = true;
+            } else if wl_ctx.resolution_changed {
                 wl_ctx.resolution_changed = false;
                 niri_monitor.set_output_dimensions(wl_ctx.width, wl_ctx.height);
                 if let ActiveEngine::Video(ref mut video) = active_engine {
                     video.resize_output(wl_ctx.width, wl_ctx.height);
                 }
                 first_frame_rendered = false;
+            }
+        }
+        if wl_dead {
+            wayland_session = None;
+        }
+        if wayland_session.is_none() {
+            match WaylandLayerContext::connect_and_init() {
+                Ok((conn, queue, ctx)) => {
+                    info!(
+                        "Wayland переподключен, слой пересоздан ({}x{})",
+                        ctx.width, ctx.height
+                    );
+                    niri_monitor.set_output_dimensions(ctx.width, ctx.height);
+                    first_frame_rendered = false;
+                    wayland_session = Some((conn, queue, ctx));
+                }
+                Err(e) => {
+                    debug!("Ожидание Wayland-соединения: {}", e);
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
             }
         }
 
@@ -187,8 +213,15 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                     ActiveEngine::None => {}
                 }
                 if power_mgr.policy.auto_hide_surface {
+                    // Поверхность намеренно НЕ отсоединяем (attach(None)):
+                    // в zwlr-layer-shell отцепление буфера при анкорах
+                    // L/R+T/B рождает у Niri протокольную ошибку "width 0
+                    // requested without setting left and right anchors" и
+                    // убивает слой навсегда. Полноэкранное окно и так
+                    // полностью закрывает фон, а последний кадр остаётся
+                    // допустимым состоянием обоев; движки на паузе.
                     if let Some((_, _, ref mut wl_ctx)) = wayland_session {
-                        wl_ctx.hide_surface_for_powersave();
+                        wl_ctx.mark_hidden_for_powersave();
                     }
                 }
                 std::thread::sleep(Duration::from_millis(50));

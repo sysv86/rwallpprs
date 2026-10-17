@@ -388,16 +388,11 @@ impl WaylandLayerContext {
         unsafe { direct.slot_slice_mut(slot) }
     }
 
-    pub fn hide_surface_for_powersave(&mut self) {
-        if self.surface_hidden {
-            return;
-        }
-        if let Some(layer_surface) = &self.layer_surface {
-            let wl_surf = layer_surface.wl_surface();
-            wl_surf.attach(None, 0, 0);
-            wl_surf.commit();
-            self.surface_hidden = true;
-        }
+    /// Пометка "обои скрыты от рисования" без отсоединения буфера поверхности:
+    /// реальное отцепление wl-буфера на layer-поверхности порождает у Niri
+    /// протокольную ошибку и убивает слой (см. место вызова в main.rs).
+    pub fn mark_hidden_for_powersave(&mut self) {
+        self.surface_hidden = true;
     }
 }
 
