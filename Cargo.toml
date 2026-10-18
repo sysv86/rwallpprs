@@ -16,7 +16,7 @@ version = "0.2.0-beta.1"
 edition = "2021"
 license = "MIT"
 authors = ["RWallpprs Contributors"]
-repository = "https://github.com/rwallpprs/rwallpprs"
+repository = "https://github.com/sysv86/rwallpprs"
 description = "Native Rust Video (ffmpeg-next VA-API/Vulkan H.264/HEVC/AV1/VP9) & GPU/CPU Wallpaper Engine for Niri on Arch Linux"
 
 [workspace.dependencies]

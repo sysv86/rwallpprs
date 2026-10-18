@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/sysv86/rwallpprs/discussions
+    about: Ask about configuration, Niri integration or writing your own wallpaper.
+  - name: Niri compositor itself
+    url: https://github.com/YaLTeR/niri/issues
+    about: Report compositor bugs (rendering, protocol, layer shell) to Niri, not to RWallpprs.

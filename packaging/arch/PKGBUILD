@@ -1,10 +1,10 @@
-# Maintainer: RWallpprs Team <maintainers@rwallpprs.local>
+# Maintainer: kerneldroid <212222389+kerneldroid@users.noreply.github.com>
 pkgname=rwallpprs
 pkgver=0.2.0_beta.1
 pkgrel=1
 pkgdesc="Native Rust Video (ffmpeg-next VA-API/Vulkan H.264/HEVC/AV1) & GPU/CPU Wallpaper Engine for Niri"
 arch=('x86_64')
-url="https://github.com/rwallpprs/rwallpprs"
+url="https://github.com/sysv86/rwallpprs"
 license=('MIT')
 depends=('wayland' 'ffmpeg' 'libva' 'vulkan-icd-loader' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'clang' 'pkgconf' 'wayland-protocols')

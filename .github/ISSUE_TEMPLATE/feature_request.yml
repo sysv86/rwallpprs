@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose a capability, an integration or an API change
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first and the proposed mechanism second. Requests that name a concrete
+        use case are far easier to evaluate than requests that name a solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can you not do today, and in which situation does that matter?
+      placeholder: |
+        I run three monitors with different refresh rates and cannot set a per-output FPS limit.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should change? Include CLI flags, config keys or API shapes if you have an opinion.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, and why they are not enough.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Video decoding (ffmpeg-next, hardware acceleration)
+        - Rust wallpaper SDK
+        - wgpu / shader rendering
+        - Niri integration (events, scrolling, Overview)
+        - Power saving and auto-hide
+        - Packaging and installation
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Niri version, hardware, screenshots, links to similar features elsewhere.
+    validations:
+      required: false

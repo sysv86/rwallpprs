@@ -1,0 +1,140 @@
+name: Bug report
+description: Something in RWallpprs does not work as documented
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. RWallpprs talks to the Wayland compositor and to the GPU directly, so
+        environment details decide most diagnoses. Please fill everything in — reports without
+        `rwallpprs status` output are usually impossible to reproduce.
+
+        Before filing: search existing issues, and try the current `master`.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happens
+      description: The actual behaviour, in concrete terms. Include exact error messages and log lines.
+      placeholder: |
+        The wallpaper freezes on the first frame and never updates when I scroll the strip.
+        The daemon logs: "..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      placeholder: The wallpaper pans with the Niri strip and keeps animating at 60 FPS.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands or Niri config, starting from a clean daemon.
+      placeholder: |
+        1. rwallpprs daemon --config config/rwallpprs.toml
+        2. rwallpprs set-video ~/Videos/clip.mp4 --hw-accel auto --fps 60
+        3. Scroll the strip with Mod+Scroll
+    validations:
+      required: true
+
+  - type: input
+    id: niri-version
+    attributes:
+      label: Niri version
+      description: Output of `niri --version`.
+      placeholder: niri 25.x.x
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      description: Distribution and version, plus how RWallpprs was installed (install.sh, PKGBUILD, manual).
+      placeholder: Arch Linux, installed with install.sh
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wallpaper-kind
+    attributes:
+      label: Wallpaper kind
+      options:
+        - Video (set-video)
+        - Native Rust binary (set-bin)
+        - Embedded binary (bundle-bin + run-embedded)
+        - No wallpaper renders at all
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Wallpaper mode
+      options:
+        - animated
+        - static
+        - reactive
+        - not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: gpu
+    attributes:
+      label: GPU, driver and session
+      description: GPU model, driver packages, Wayland session type, and the output of `lspci -nn | grep -Ei 'vga|3d|display'`.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: "`rwallpprs status` output"
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug logs
+      description: Output of `RUST_LOG=debug rwallpprs daemon --config config/rwallpprs.toml`.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: video-file
+    attributes:
+      label: Video file details (video wallpapers only)
+      description: Codec, container, resolution and frame rate, for example from `ffprobe -hide_banner`.
+      placeholder: AV1 in MP4, 3840x2160, 60 fps
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: The parts of `rwallpprs.toml` or `config.kdl` that differ from the defaults.
+      render: toml
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and did not find this problem.
+          required: true
+        - label: I reproduced this on the current `master`.
+          required: false
