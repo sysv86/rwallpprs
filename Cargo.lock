@@ -852,16 +852,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "niri-landroid"
-version = "0.2.0-beta.1"
-dependencies = [
- "anyhow",
- "bytemuck",
- "rwallpprs-sdk",
- "wgpu",
-]
-
-[[package]]
 name = "niri-voronoi-flow"
 version = "0.2.0-beta.1"
 dependencies = [
