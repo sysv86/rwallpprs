@@ -9,7 +9,6 @@
 #
 # Options:
 #   --prefix DIR     Install prefix for binaries and libraries (default: /usr/local)
-#   --wallpapers     Install only the bundled example wallpapers
 #   --no-deps        Do not run pacman; assume every dependency is present
 #   --no-systemd     Do not install the systemd user unit
 #   --uninstall      Remove an installation made by this script
@@ -43,14 +42,14 @@ warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,25p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+    # Print the leading comment block, up to the first blank line.
+    sed -n '3,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)     [[ -n "${2:-}" ]] || die "--prefix needs a directory"; PREFIX="$2"; shift 2 ;;
         --prefix=*)   PREFIX="${1#*=}"; shift ;;
-        --wallpapers) MODE="wallpapers"; shift ;;
         --no-deps)    INSTALL_DEPS=0; shift ;;
         --no-systemd) INSTALL_SYSTEMD=0; shift ;;
         --uninstall)  MODE="uninstall"; shift ;;
@@ -68,7 +67,7 @@ if [[ ! -t 0 && -z "${RWALLPPRS_INSTALL_REEXEC:-}" ]]; then
     export RWALLPPRS_INSTALL_REEXEC=1
     tmp="$(mktemp /tmp/rwallpprs-install.XXXXXX.sh)"
     curl -fsSL "$SELF_URL" -o "$tmp" || die "could not download $SELF_URL"
-    if [[ -r /dev/tty ]]; then
+    if { : </dev/tty; } 2>/dev/null; then
         exec bash "$tmp" "$@" </dev/tty
     fi
     exec bash "$tmp" "$@"
@@ -103,7 +102,7 @@ else
     CLEANUP="$SRC_DIR"
 fi
 
-cleanup() { [[ -n "${CLEANUP:-}" ]] && rm -rf "$CLEANUP"; }
+cleanup() { if [[ -n "${CLEANUP:-}" ]]; then rm -rf "$CLEANUP"; fi; }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
