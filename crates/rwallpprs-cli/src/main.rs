@@ -1,8 +1,9 @@
-//! CLI-утилита `rwallpprs` (`v0.2.0-beta.1`).
+//! `rwallpprs` CLI utility (`v0.2.0-beta.1`).
 //!
-//! При запуске `rwallpprs run-embedded` извлекает вложенный ELF-образ обоев из конца
-//! собственного файла и передает его по фреймированному сокету в `rwallpprs-daemon`
-//! (`ControlCommand::SetEmbeddedBin`), где демон сохраняет его в персистентный `memfd`.
+//! When run as `rwallpprs run-embedded`, it extracts the wallpaper ELF image
+//! embedded at the end of its own file and hands it over a framed socket to
+//! `rwallpprs-daemon` (`ControlCommand::SetEmbeddedBin`), where the daemon
+//! stores it in a persistent `memfd`.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -21,7 +22,7 @@ use std::process::Command;
 #[command(
     name = "rwallpprs",
     version,
-    about = "Видео (ffmpeg-next H.264/HEVC/AV1/VP9) и Нативные GPU/CPU Rust-обои для композитора Niri (Arch Linux)"
+    about = "Video (ffmpeg-next H.264/HEVC/AV1/VP9) and native GPU/CPU Rust wallpapers for the Niri compositor (Arch Linux)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -99,13 +100,13 @@ impl ToggleSwitch {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Запустить фоновый демон RWallpprs под Niri
+    /// Run the background RWallpprs daemon under Niri
     Daemon {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
 
-    /// Установить видео-обои через нативный декодер ffmpeg-next (H.264, HEVC, VP9, AV1)
+    /// Set a video wallpaper through the native ffmpeg-next decoder (H.264, HEVC, VP9, AV1)
     SetVideo {
         path: PathBuf,
         #[arg(short, long)]
@@ -118,7 +119,7 @@ enum Commands {
         scale: CliScaleMode,
     },
 
-    /// Запустить скомпилированный бинарник Rust-обоев на рабочем столе Niri
+    /// Run a compiled Rust wallpaper binary on the Niri desktop
     SetBin {
         bin_path: PathBuf,
         #[arg(short, long, value_enum, default_value_t = CliRustMode::Animated)]
@@ -131,14 +132,14 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Вшить бинарник Rust-обоев внутрь исполняемого файла CLI
+    /// Embed a Rust wallpaper binary inside the CLI executable
     BundleBin {
         bin_path: PathBuf,
         #[arg(short, long)]
         output_cli: PathBuf,
     },
 
-    /// Передать вшитый в этот CLI бинарник обоев в персистентный memfd демона и запустить
+    /// Hand the wallpaper binary embedded in this CLI to a persistent daemon memfd and run it
     RunEmbedded {
         #[arg(short, long, value_enum, default_value_t = CliRustMode::Animated)]
         mode: CliRustMode,
@@ -148,7 +149,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Настройка энергосбережения и автоматического скрытия обоев в Niri
+    /// Configure power saving and automatic wallpaper hiding in Niri
     Power {
         #[arg(long, value_enum)]
         enabled: Option<ToggleSwitch>,
@@ -166,10 +167,10 @@ enum Commands {
         toggle_pause: bool,
     },
 
-    /// Показать текущий статус демона, кодек/PID и состояние окон Niri
+    /// Show the current daemon status, codec/PID and Niri window state
     Status,
 
-    /// Остановить демон RWallpprs
+    /// Stop the RWallpprs daemon
     Stop,
 }
 
@@ -182,7 +183,7 @@ fn send_command(cmd: &ControlCommand) -> Result<ControlResponse> {
     let sock = control_socket_path();
     let mut stream = UnixStream::connect(&sock).with_context(|| {
         format!(
-            "Не удалось подключиться к демону RWallpprs по сокету {:?}. Запустите `rwallpprs daemon`",
+            "Could not connect to the RWallpprs daemon over socket {:?}. Start `rwallpprs daemon`",
             sock
         )
     })?;
@@ -192,10 +193,10 @@ fn send_command(cmd: &ControlCommand) -> Result<ControlResponse> {
 }
 
 fn bundle_binary_into_cli(wallpaper_bin: &PathBuf, out_cli: &PathBuf) -> Result<()> {
-    let self_exe = std::env::current_exe().context("Не удалось определить текущий бинарник CLI")?;
+    let self_exe = std::env::current_exe().context("Could not determine the current CLI binary")?;
     let mut cli_bytes = std::fs::read(&self_exe)?;
     let wp_bytes = std::fs::read(wallpaper_bin)
-        .with_context(|| format!("Не удалось прочитать бинарник обоев {:?}", wallpaper_bin))?;
+        .with_context(|| format!("Could not read wallpaper binary {:?}", wallpaper_bin))?;
 
     let payload_len = wp_bytes.len() as u64;
     cli_bytes.extend_from_slice(&wp_bytes);
@@ -208,8 +209,8 @@ fn bundle_binary_into_cli(wallpaper_bin: &PathBuf, out_cli: &PathBuf) -> Result<
     std::fs::set_permissions(out_cli, perms)?;
 
     println!(
-        "Бинарник обоев {:?} ({} КБ) вложен в {:?}.
-Запуск: {:?} run-embedded --mode animated --fps 60",
+        "Wallpaper binary {:?} ({} KB) embedded into {:?}.
+Run: {:?} run-embedded --mode animated --fps 60",
         wallpaper_bin,
         wp_bytes.len() / 1024,
         out_cli,
@@ -230,7 +231,7 @@ fn read_embedded_elf_payload() -> Result<(String, Vec<u8>)> {
 
     let footer_len = (EMBEDDED_BIN_MAGIC.len() + 8) as u64;
     if total_len <= footer_len {
-        anyhow::bail!("В данный CLI-файл не вложен бинарник обоев");
+        anyhow::bail!("No wallpaper binary is embedded in this CLI file");
     }
 
     file.seek(SeekFrom::End(-(footer_len as i64)))?;
@@ -242,13 +243,13 @@ fn read_embedded_elf_payload() -> Result<(String, Vec<u8>)> {
     file.read_exact(&mut magic_buf)?;
     if &magic_buf != EMBEDDED_BIN_MAGIC {
         anyhow::bail!(
-            "Сигнатура RWALLPPRS_EMBED_V2 не найдена. Сначала упакуйте бинарник командой `rwallpprs bundle-bin <BIN> -o <OUT>`"
+            "RWALLPPRS_EMBED_V2 signature not found. Pack the binary first with `rwallpprs bundle-bin <BIN> -o <OUT>`"
         );
     }
 
     let payload_offset = total_len
         .checked_sub(footer_len + payload_len)
-        .context("Поврежденный размер вложенного бинарника")?;
+        .context("Corrupted embedded binary size")?;
     file.seek(SeekFrom::Start(payload_offset))?;
 
     let mut payload = vec![0u8; payload_len as usize];
@@ -267,9 +268,9 @@ fn main() -> Result<()> {
             }
             let status = cmd
                 .status()
-                .context("Не удалось запустить `rwallpprs-daemon`")?;
+                .context("Failed to launch `rwallpprs-daemon`")?;
             if !status.success() {
-                anyhow::bail!("rwallpprs-daemon завершился с кодом {:?}", status.code());
+                anyhow::bail!("rwallpprs-daemon exited with code {:?}", status.code());
             }
         }
         Commands::SetVideo {
@@ -382,13 +383,13 @@ fn main() -> Result<()> {
 fn print_response(resp: ControlResponse) {
     match resp {
         ControlResponse::Ok { message } => println!("[OK] {}", message),
-        ControlResponse::Error { reason } => eprintln!("[ОШИБКА] {}", reason),
+        ControlResponse::Error { reason } => eprintln!("[ERROR] {}", reason),
         ControlResponse::Status(st) => {
             println!("=== RWallpprs v0.2.0-beta.1 Daemon Status (Niri) ===");
-            println!("PID демона          : {}", st.pid);
-            println!("NIRI_SOCKET активен : {}", st.niri_socket_connected);
-            println!("Активный источник   : {}", st.active_source);
-            println!("Состояние рендера   : {:?}", st.power_state);
+            println!("Daemon PID          : {}", st.pid);
+            println!("NIRI_SOCKET active  : {}", st.niri_socket_connected);
+            println!("Active source       : {}", st.active_source);
+            println!("Render state        : {:?}", st.power_state);
             println!(
                 "Niri Viewport       : workspace=#{} (id={}), overview={}, fullscreen={}, focused_ratio={:.2}, screen_coverage={:.2}, scroll={:.1}",
                 st.niri_state.active_workspace_idx,
@@ -400,7 +401,7 @@ fn print_response(resp: ControlResponse) {
                 st.niri_state.strip_scroll_offset
             );
             println!(
-                "Энергосбережение    : enabled={}, auto_hide={}, fullscreen_pause={}, max_col_pause={} (>={:.0}%), bat_limit={}%",
+                "Power saving        : enabled={}, auto_hide={}, fullscreen_pause={}, max_col_pause={} (>={:.0}%), bat_limit={}%",
                 st.policy.enabled,
                 st.policy.auto_hide_surface,
                 st.policy.pause_on_fullscreen,
@@ -410,7 +411,7 @@ fn print_response(resp: ControlResponse) {
             );
             for out in st.outputs {
                 println!(
-                    "Монитор {:<12}: {}x{} | wl_surface видима={} | целевой FPS={:.0}",
+                    "Monitor {:<12}: {}x{} | wl_surface visible={} | target FPS={:.0}",
                     out.name, out.width, out.height, out.surface_visible, out.current_fps
                 );
             }

@@ -1,7 +1,7 @@
-//! Аппаратные GPU-обои `niri-cyber-grid` на базе `wgpu` (Vulkan/GL WGSL шейдер)
-//! с автоматическим CPU-фоллбэком.
+//! Hardware GPU wallpaper `niri-cyber-grid` built on `wgpu` (Vulkan/GL WGSL shader)
+//! with an automatic CPU fallback.
 //!
-//! Читает `u.niri_scroll_offset` и `u.niri_overview_open` напрямую внутри WGSL-шейдера!
+//! Reads `u.niri_scroll_offset` and `u.niri_overview_open` directly inside the WGSL shader!
 
 use rwallpprs_sdk::{
     run_shader_wallpaper, Canvas, Color, FrameContext, GpuShaderWallpaper, RustWallpaperMode,

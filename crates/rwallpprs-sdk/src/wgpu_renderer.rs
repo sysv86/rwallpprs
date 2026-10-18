@@ -1,13 +1,14 @@
-//! Аппаратный GPU-рендерер для Rust-обоев на базе [`wgpu`] (Vulkan / GL / Metal).
+//! Hardware GPU renderer for Rust wallpapers built on [`wgpu`] (Vulkan / GL / Metal).
 //!
-//! Позволяет писать фрагментные шейдеры на языке **WGSL**, которые исполняются на видеокарте
-//! в безголовом режиме (Offscreen Texture `Bgra8Unorm`), автоматически получают состояние
-//! композитора **Niri** через Uniform-буфер [`NiriShaderUniforms`] и выгружают готовые пиксели
-//! (`BGRA8` / `ARGB8888`) напрямую в разделяемую память `memfd` демона!
+//! Lets you write **WGSL** fragment shaders that execute on the GPU in headless mode
+//! (offscreen `Bgra8Unorm` texture), automatically receive **Niri** compositor state
+//! through the [`NiriShaderUniforms`] uniform buffer, and write finished pixels
+//! (`BGRA8` / `ARGB8888`) straight into the daemon `memfd` shared memory.
 //!
-//! Для сложных 2D-сцен (тысячи линий/кругов/полигонов, инстансинг, собственные пайплайны
-//! и несколько проходов) используйте сценовый API: типаж [`GpuSceneWallpaper`], контекст кадра
-//! [`GpuScene`] и адаптер [`SceneWallpaperAdapter`] с макросом `run_scene_wallpaper!`.
+//! For complex 2D scenes (thousands of lines/circles/polygons, instancing, custom
+//! pipelines, multiple passes) use the scene API: the [`GpuSceneWallpaper`] trait,
+//! the [`GpuScene`] frame context and the [`SceneWallpaperAdapter`] adapter with the
+//! `run_scene_wallpaper!` macro.
 
 use crate::{Canvas, FrameContext, RustWallpaperMode, Wallpaper};
 use anyhow::{Context, Result};
@@ -16,14 +17,14 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::mpsc::TryRecvError;
 
-/// Формат offscreen-текстуры (`Bgra8Unorm`), в которую рисуют сценовые обои.
+/// Offscreen texture format (`Bgra8Unorm`) that scene wallpapers render into.
 ///
-/// Совпадает с порядком байт Wayland `ARGB8888` / `XRGB8888` на Little-Endian,
-/// поэтому готовый кадр можно memcpy'ить прямо в [`Canvas`] без конвертации.
+/// Matches the Wayland `ARGB8888` / `XRGB8888` byte order on little-endian, so the
+/// finished frame can be memcpy'd straight into a [`Canvas`] without conversion.
 pub const SCENE_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
-/// Распаковывает построчно отображённый staging-буфер (с выравниванием строки по 256 байт)
-/// в пиксели [`Canvas`], игнорируя padding каждой строки.
+/// Unpacks a row-padded mapped staging buffer (256-byte row alignment) into
+/// [`Canvas`] pixels, ignoring each row's padding.
 fn copy_rows_to_canvas(
     mapped: &[u8],
     canvas: &mut Canvas<'_>,
@@ -53,53 +54,55 @@ fn copy_rows_to_canvas(
     }
 }
 
-/// Количество staging-буферов в пуле readback'а.
+/// Number of staging buffers in the readback pool.
 ///
-/// Двух хватает для конвейера «пока GPU рисует кадр `N`, CPU читает кадр `N-1`»,
-/// третий даёт запас, чтобы CPU не упирался в занятость буферов при коротких
-/// всплесках задержки GPU.
+/// Two are enough for the "GPU draws frame `N` while the CPU reads frame `N-1`"
+/// pipeline; a third adds slack so the CPU does not run into busy buffers during
+/// short GPU latency spikes.
 const READBACK_SLOTS: usize = 3;
 
-/// Состояние одного staging-буфера пула readback'а.
+/// State of a single staging buffer in the readback pool.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotState {
-    /// Буфер свободен (не замаплен), в него можно писать копию нового кадра.
+    /// Buffer is free (not mapped) and ready for a copy of the next frame.
     Free,
-    /// Копия отправлена на GPU, `map_async` ждёт завершения сабмита.
+    /// Copy submitted to the GPU, `map_async` waits for the submission to finish.
     InFlight,
-    /// `map_async` завершился успешно — данные готовы к копированию в [`Canvas`].
+    /// `map_async` completed successfully — data is ready to copy into [`Canvas`].
     Mapped,
 }
 
-/// Один staging-буфер пула вместе с состоянием его readback'а.
+/// One staging buffer of the pool together with its readback state.
 struct ReadbackSlot {
     buffer: wgpu::Buffer,
     state: SlotState,
-    /// Сабмит, в котором буфер был заполнен (для точечного ожидания `WaitForSubmissionIndex`).
+    /// Submission the buffer was filled in (for a targeted `WaitForSubmissionIndex`).
     submission: Option<wgpu::SubmissionIndex>,
-    /// Приёмник результата `map_async` текущего использования слота.
+    /// Receiver for the `map_async` result of the slot's current use.
     rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
-/// Пул staging-буферов с двойной (тройной) буферизацией GPU→CPU readback'а.
+/// Pool of staging buffers with double (triple) buffering of the GPU→CPU readback.
 ///
-/// Вместо синхронной пары «`submit` → `Maintain::Wait` → `unmap`» на каждый кадр пул
-/// держит несколько буферов и слот состояния для каждого. На кадре `N` копия текстуры
-/// пишется в свободный слот, а в [`Canvas`] выдаётся уже посчитанный кадр `N-1`: пока
-/// GPU занят кадром `N`, CPU спокойно забирает `N-1`. За счёт этого
-/// `device.poll(Maintain::Wait)` больше не вызывается на только что отправленный сабмит.
+/// Instead of a synchronous "`submit` → `Maintain::Wait` → `unmap`" pair per frame,
+/// the pool holds several buffers with a state slot each. On frame `N` the texture
+/// copy goes into a free slot while the already computed frame `N-1` is handed to
+/// [`Canvas`]: the GPU keeps working on `N` while the CPU picks up `N-1`. As a
+/// result `device.poll(Maintain::Wait)` is no longer called on the submission that
+/// was just sent.
 ///
-/// Цена — задержка вывода в один кадр (для обоев несущественно). Первый кадр и кадр
-/// после смены размера выдаются синхронно, чтобы [`Canvas`] никогда не оставался пустым.
+/// The price is one frame of output latency (irrelevant for wallpapers). The first
+/// frame and the frame after a resize are delivered synchronously so the [`Canvas`]
+/// is never left empty.
 struct StagingPool {
     slots: Vec<ReadbackSlot>,
-    /// Индексы слотов в порядке отправки — очередь на выдачу в [`Canvas`].
+    /// Slot indices in submission order — the queue for delivery into [`Canvas`].
     pending: VecDeque<usize>,
-    /// Кэш выбора свободного слота (round-robin).
+    /// Cache of the free-slot choice (round-robin).
     cursor: usize,
-    /// Выровненная (по 256 байт) длина строки staging-буфера.
+    /// Aligned (256-byte) row length of the staging buffer.
     bytes_per_row: u32,
-    /// Сколько кадров уже выдано в [`Canvas`] (нужно для синхронного первого кадра).
+    /// How many frames have been delivered into [`Canvas`] (needed for a synchronous first frame).
     delivered: u64,
 }
 
@@ -116,10 +119,10 @@ impl StagingPool {
         pool
     }
 
-    /// Пересобирает пул под новый размер кадра и сбрасывает конвейер: ближайший кадр
-    /// снова будет выдан синхронно (см. [`Self::finish_frame`]).
+    /// Rebuilds the pool for a new frame size and resets the pipeline: the next frame
+    /// is delivered synchronously again (see [`Self::finish_frame`]).
     fn recreate(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        // Замапленные буферы сначала аккуратно снимаем с маппинга, затем отпускаем.
+        // Unmap mapped buffers first, then release them.
         for slot in &mut self.slots {
             if slot.state == SlotState::Mapped {
                 slot.buffer.unmap();
@@ -150,20 +153,20 @@ impl StagingPool {
         }
     }
 
-    /// Выровненная длина строки, которую нужно указывать в `copy_texture_to_buffer`.
+    /// Aligned row length to pass to `copy_texture_to_buffer`.
     fn bytes_per_row(&self) -> u32 {
         self.bytes_per_row
     }
 
-    /// Возвращает буфер слота, в который нужно записать копию текстуры кадра.
+    /// Returns the slot buffer to write the frame texture copy into.
     fn slot_buffer(&self, idx: usize) -> &wgpu::Buffer {
         &self.slots[idx].buffer
     }
 
-    /// Подыскивает свободный слот под копию нового кадра.
+    /// Picks a free slot for the copy of the new frame.
     ///
-    /// Если все слоты заняты (GPU хронически отстаёт), принудительно выдаёт самый
-    /// старый кадр — блокируясь на его сабмите, а не на только что отправленном.
+    /// If every slot is busy (the GPU is chronically behind), it force-delivers the
+    /// oldest frame, blocking on that submission rather than the one just sent.
     fn begin_frame(
         &mut self,
         device: &wgpu::Device,
@@ -175,8 +178,8 @@ impl StagingPool {
         Ok(self.acquire_free())
     }
 
-    /// Регистрирует `map_async` для только что отправленного кадра и выдаёт в [`Canvas`]
-    /// уже посчитанный более старый кадр (в установившемся конвейере — `N-1`).
+    /// Registers `map_async` for the submission just sent and hands an already
+    /// computed older frame to [`Canvas`] (in steady state, `N-1`).
     fn finish_frame(
         &mut self,
         device: &wgpu::Device,
@@ -196,9 +199,9 @@ impl StagingPool {
         self.slots[idx].state = SlotState::InFlight;
         self.pending.push_back(idx);
 
-        // Первый кадр (и кадр после resize) выдаём синхронно, чтобы `Canvas` не остался
-        // пустым. Дальше держим конвейер глубиной в один кадр: выдаём `N-1`, не трогая
-        // свежий `N` — именно это даёт перекрытие работы GPU и CPU.
+        // The first frame (and the frame after a resize) is delivered synchronously so the
+        // `Canvas` is never empty. After that the pipeline stays one frame deep: deliver `N-1`
+        // without touching the fresh `N`, which is exactly what overlaps GPU and CPU work.
         if self.pending.len() > 1 || self.delivered == 0 {
             self.deliver_oldest(device, canvas)?;
         }
@@ -213,37 +216,37 @@ impl StagingPool {
                 return idx;
             }
         }
-        // Сюда попадать не должны: `begin_frame` освобождает слот при заполнении пула.
+        // This should be unreachable: `begin_frame` frees a slot when the pool fills up.
         self.cursor = (self.cursor + 1) % self.slots.len();
         self.cursor
     }
 
-    /// Выдаёт самый старый кадр из очереди в [`Canvas`] и освобождает его слот.
+    /// Delivers the oldest queued frame into [`Canvas`] and frees its slot.
     fn deliver_oldest(&mut self, device: &wgpu::Device, canvas: &mut Canvas<'_>) -> Result<()> {
         let idx = match self.pending.front() {
             Some(&idx) => idx,
             None => return Ok(()),
         };
 
-        // Сначала дешёвый неблокирующий опрос: обычно кадр `N-1` уже готов.
+        // Cheap non-blocking poll first: usually frame `N-1` is already done.
         let mut ready = self.poll_slot(idx)?;
         if !ready {
-            // Ждём именно сабмит этого кадра (`N-1`), а не самый свежий (`N`): так GPU
-            // продолжает работать над `N`, пока CPU забирает `N-1`.
+            // Wait for this frame's submission (`N-1`) rather than the newest one (`N`), so
+            // the GPU keeps working on `N` while the CPU picks up `N-1`.
             match self.slots[idx].submission.take() {
                 Some(sub) => device.poll(wgpu::Maintain::WaitForSubmissionIndex(sub)),
                 None => device.poll(wgpu::Maintain::Wait),
             };
             ready = self.poll_slot(idx)?;
             if !ready {
-                // Перестраховка для бэкендов без поддержки точечного ожидания.
+                // Safety net for backends without targeted wait support.
                 device.poll(wgpu::Maintain::Wait);
                 ready = self.poll_slot(idx)?;
             }
         }
 
         if !ready {
-            anyhow::bail!("staging-буфер readback'а так и не замапился");
+            anyhow::bail!("the readback staging buffer never mapped");
         }
 
         {
@@ -266,7 +269,7 @@ impl StagingPool {
         Ok(())
     }
 
-    /// Неблокирующая проверка: завершился ли `map_async` слота.
+    /// Non-blocking check: has the slot's `map_async` finished?
     fn poll_slot(&mut self, idx: usize) -> Result<bool> {
         if self.slots[idx].state == SlotState::Mapped {
             return Ok(true);
@@ -281,54 +284,54 @@ impl StagingPool {
                 Ok(true)
             }
             Some(Ok(Err(e))) => {
-                anyhow::bail!("map_async staging-буфера завершился ошибкой: {e}")
+                anyhow::bail!("staging buffer map_async failed: {e}")
             }
             Some(Err(TryRecvError::Empty)) => Ok(false),
             Some(Err(TryRecvError::Disconnected)) => {
-                anyhow::bail!("callback map_async staging-буфера потерян")
+                anyhow::bail!("staging buffer map_async callback lost")
             }
             None => Ok(false),
         }
     }
 }
 
-/// Структура Uniform-буфера (`@group(0) @binding(0) var<uniform> u: NiriShaderUniforms;`),
-/// доступная внутри любого WGSL-шейдера обоев.
+/// Layout of the uniform buffer (`@group(0) @binding(0) var<uniform> u: NiriShaderUniforms;`)
+/// available inside any wallpaper WGSL shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct NiriShaderUniforms {
-    /// Разрешение экрана в пикселях `(width, height)`.
+    /// Screen resolution in pixels `(width, height)`.
     pub resolution: [f32; 2],
-    /// Время с момента старта в секундах.
+    /// Seconds since startup.
     pub time: f32,
-    /// Дельта времени кадра в секундах.
+    /// Frame delta time in seconds.
     pub dt: f32,
-    /// Горизонтальное смещение скролла ленты Niri.
+    /// Horizontal scroll offset of the Niri strip.
     pub niri_scroll_offset: f32,
-    /// Индекс активного воркспейса Niri.
+    /// Index of the active Niri workspace.
     pub niri_workspace_idx: u32,
-    /// `1.0`, если открыт режим Niri Overview (`Mod+O`), иначе `0.0`.
+    /// `1.0` if Niri Overview (`Mod+O`) is open, otherwise `0.0`.
     pub niri_overview_open: f32,
-    /// Количество видимых окон на активном воркспейсе Niri.
+    /// Number of visible windows on the active Niri workspace.
     pub niri_windows_count: u32,
 }
 
-/// Высокоуровневый типаж для создания аппаратных GPU-обоев на базе WGSL-шейдера.
+/// High-level trait for hardware GPU wallpapers driven by a WGSL shader.
 pub trait GpuShaderWallpaper: Sized + 'static {
-    /// Инициализация параметров обоев.
+    /// Initialize wallpaper parameters.
     fn init(args: &[String]) -> Self;
 
-    /// Исходный код шейдера на языке WGSL (должен содержать `vs_main` и `fs_main`,
-    /// либо только `fs_main(in: VertexOutput) -> @location(0) vec4<f32>` при использовании
-    /// стандартного полноэкранного треугольника).
+    /// WGSL shader source (must provide either both `vs_main` and `fs_main`, or only
+    /// `fs_main(in: VertexOutput) -> @location(0) vec4<f32>` when the default fullscreen
+    /// triangle vertex shader is used).
     fn wgsl_fragment_source(&self) -> &str;
 
-    /// Режим работы (`Animated`, `Static`, `ReactiveNiri`).
+    /// Run mode (`Animated`, `Static`, `ReactiveNiri`).
     fn default_mode(&self) -> RustWallpaperMode {
         RustWallpaperMode::Animated
     }
 
-    /// Программный CPU-фоллбэк на случай запуска в окружении без GPU/Vulkan.
+    /// CPU fallback for environments without a GPU/Vulkan.
     fn fallback_cpu_render(&mut self, ctx: &FrameContext, canvas: &mut Canvas<'_>);
 }
 
@@ -363,14 +366,14 @@ impl WgpuHeadlessPipeline {
                 force_fallback_adapter: false,
             })
             .await
-            .context("Не найден совместимый адаптер Vulkan/GL для wgpu")?;
+            .context("No compatible Vulkan/GL adapter found for wgpu")?;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await
-            .context("Не удалось открыть логическое устройство wgpu::Device")?;
+            .context("Failed to open a logical wgpu::Device")?;
 
-        // Собираем полный шейдерный модуль со встроенным вершинным шейдером полноэкранного треугольника
+        // Assemble the full shader module with the built-in fullscreen triangle vertex shader
         let full_wgsl = format!(
             r#"
 struct NiriShaderUniforms {{
@@ -526,7 +529,7 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {{
         self.height = height;
     }
 
-    /// Исполняет WGSL-шейдер на GPU и копирует результат напрямую в zero-copy `Canvas` (`memfd`).
+    /// Executes the WGSL shader on the GPU and copies the result straight into the zero-copy [`Canvas`] (`memfd`).
     pub fn render_to_canvas(&mut self, ctx: &FrameContext, canvas: &mut Canvas<'_>) -> Result<()> {
         self.resize_if_needed(ctx.width, ctx.height);
 
@@ -543,7 +546,7 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {{
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        // Слот-приёмник копии этого кадра; попутно пул может выдать в canvas кадр N-1.
+        // Slot that receives this frame's copy; the pool may also deliver frame N-1 to the canvas.
         let slot = self.pool.begin_frame(&self.device, canvas)?;
 
         let mut encoder = self
@@ -599,8 +602,8 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {{
     }
 }
 
-/// Адаптер, превращающий любой [`GpuShaderWallpaper`] в стандартный [`Wallpaper`] с автоматическим
-/// фоллбэком на CPU, если Vulkan/GL недоступен.
+/// Adapter turning any [`GpuShaderWallpaper`] into a standard [`Wallpaper`], with automatic
+/// CPU fallback when Vulkan/GL is unavailable.
 pub struct ShaderWallpaperAdapter<S: GpuShaderWallpaper> {
     inner: S,
     gpu: Option<WgpuHeadlessPipeline>,
@@ -631,14 +634,14 @@ impl<S: GpuShaderWallpaper> Wallpaper for ShaderWallpaperAdapter<S> {
             ) {
                 Ok(pipeline) => {
                     eprintln!(
-                        "[rwallpprs-sdk] WGPU (Vulkan/GL) шейдерный конвейер успешно инициализирован ({}x{})",
+                        "[rwallpprs-sdk] WGPU (Vulkan/GL) shader pipeline initialized successfully ({}x{})",
                         ctx.width, ctx.height
                     );
                     self.gpu = Some(pipeline);
                 }
                 Err(e) => {
                     eprintln!(
-                        "[rwallpprs-sdk] WGPU недоступен ({}), используется CPU-рендерер",
+                        "[rwallpprs-sdk] WGPU unavailable ({}), using the CPU renderer",
                         e
                     );
                 }
@@ -657,65 +660,66 @@ impl<S: GpuShaderWallpaper> Wallpaper for ShaderWallpaperAdapter<S> {
     }
 }
 
-/// Контекст одного кадра для **сценовых** GPU-обоев.
+/// Per-frame context for **scene** GPU wallpapers.
 ///
-/// В отличие от [`GpuShaderWallpaper`] (один фрагментный WGSL-шейдер), сценовые обои получают
-/// полноценный доступ к [`wgpu::Device`], [`wgpu::Queue`] и [`wgpu::CommandEncoder`], поэтому могут
-/// создавать собственные пайплайны, вершинные/индексные буферы, инстансинг (тысячи линий, кругов,
-/// полигонов), несколько render pass'ов и промежуточные текстуры.
+/// Unlike [`GpuShaderWallpaper`] (a single fragment WGSL shader), scene wallpapers get
+/// full access to [`wgpu::Device`], [`wgpu::Queue`] and [`wgpu::CommandEncoder`], so they
+/// can build their own pipelines, vertex/index buffers, instancing (thousands of lines,
+/// circles, polygons), multiple render passes and intermediate textures.
 ///
-/// Обои САМИ записывают свои render pass'ы в [`GpuScene::encoder`], рисуя в [`GpuScene::target`]
-/// (формат [`GpuScene::format`] = [`SCENE_TARGET_FORMAT`]). SDK сам выгружает результат в [`Canvas`].
+/// The wallpaper writes its own render passes into [`GpuScene::encoder`], drawing into
+/// [`GpuScene::target`] (format [`GpuScene::format`] = [`SCENE_TARGET_FORMAT`]). The SDK
+/// copies the result into the [`Canvas`] itself.
 pub struct GpuScene<'a> {
-    /// Логическое устройство `wgpu` (создание буферов, пайплайнов, текстур и т.д.).
+    /// Logical `wgpu` device (creating buffers, pipelines, textures, etc.).
     pub device: &'a wgpu::Device,
-    /// Очередь `wgpu` (загрузка данных в буферы/текстуры через `write_buffer` / `write_texture`).
+    /// `wgpu` queue (uploading data into buffers/textures via `write_buffer` / `write_texture`).
     pub queue: &'a wgpu::Queue,
-    /// Кодировщик команд текущего кадра — сюда обои пишут свои render pass'ы.
+    /// Command encoder for the current frame — wallpapers write their render passes here.
     pub encoder: &'a mut wgpu::CommandEncoder,
-    /// Целевая offscreen-текстура кадра (`Bgra8Unorm`), в которую нужно рисовать.
+    /// Target offscreen texture for the frame (`Bgra8Unorm`) to draw into.
     pub target: &'a wgpu::TextureView,
-    /// Формат целевой текстуры (`Bgra8Unorm`).
+    /// Target texture format (`Bgra8Unorm`).
     pub format: wgpu::TextureFormat,
-    /// Ширина кадра в пикселях.
+    /// Frame width in pixels.
     pub width: u32,
-    /// Высота кадра в пикселях.
+    /// Frame height in pixels.
     pub height: u32,
 }
 
-/// Высокоуровневый типаж для **сценовых** аппаратных обоев на базе полноценного `wgpu`.
+/// High-level trait for **scene** hardware wallpapers built on full `wgpu`.
 ///
-/// Используйте его, когда фрагментного шейдера недостаточно: тысячи инстансов геометрии,
-/// собственные пайплайны, несколько проходов, вычислительные шейдеры подготовки данных и т.п.
+/// Use it when a fragment shader is not enough: thousands of geometry instances,
+/// custom pipelines, multiple passes, compute shaders preparing data, and so on.
 pub trait GpuSceneWallpaper: Sized + 'static {
-    /// Инициализация параметров обоев.
+    /// Initialize wallpaper parameters.
     fn init(args: &[String]) -> Self;
 
-    /// Режим работы (`Animated`, `Static`, `ReactiveNiri`).
+    /// Run mode (`Animated`, `Static`, `ReactiveNiri`).
     fn default_mode(&self) -> RustWallpaperMode {
         RustWallpaperMode::Animated
     }
 
-    /// Вызывается демоном при засыпании/скрытии обоев (например, для паузы симуляции).
+    /// Called by the daemon when the wallpaper sleeps or is hidden (e.g. to pause the simulation).
     fn on_suspend(&mut self) {}
 
-    /// Вызывается демоном при возобновлении обоев.
+    /// Called by the daemon when the wallpaper resumes.
     fn on_resume(&mut self) {}
 
-    /// Рисует один кадр сцены, записывая render pass'ы в `scene.encoder` и рисуя в `scene.target`.
+    /// Draws one scene frame, writing render passes into `scene.encoder` and drawing into `scene.target`.
     ///
-    /// Возвращает `true`, если кадр изменился (демон обновит стол). `false` допустим для пауз,
-    /// когда содержимое не поменялось — демон пропустит кадр без перерисовки.
+    /// Returns `true` when the frame changed (the daemon updates the desktop). `false` is
+    /// allowed for pauses when the content did not change — the daemon then skips the frame.
     fn render_scene(&mut self, ctx: &FrameContext, scene: &mut GpuScene<'_>) -> bool;
 
-    /// Программный CPU-фоллбэк на случай запуска в окружении без GPU/Vulkan.
+    /// CPU fallback for environments without a GPU/Vulkan.
     ///
-    /// Обязателен: минимальная картинка, чтобы обои жили без GPU.
+    /// Required: a minimal image so the wallpaper still works without a GPU.
     fn fallback_cpu_render(&mut self, ctx: &FrameContext, canvas: &mut Canvas<'_>);
 }
 
-/// Внутренний headless-конвейер сценовых обоев: offscreen-текстура + пул staging-буферов
-/// для асинхронного readback'а.
+/// Internal headless pipeline for scene wallpapers: offscreen texture + staging buffer pool
+/// for asynchronous readback.
 struct WgpuScenePipeline {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -740,12 +744,12 @@ impl WgpuScenePipeline {
                 force_fallback_adapter: false,
             })
             .await
-            .context("Не найден совместимый адаптер Vulkan/GL для wgpu")?;
+            .context("No compatible Vulkan/GL adapter found for wgpu")?;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await
-            .context("Не удалось открыть логическое устройство wgpu::Device")?;
+            .context("Failed to open a logical wgpu::Device")?;
 
         let (target_texture, target_view) =
             WgpuHeadlessPipeline::create_render_targets(&device, width, height);
@@ -774,10 +778,10 @@ impl WgpuScenePipeline {
         self.height = height;
     }
 
-    /// Даёт обоям отрисовать сцену, затем копирует offscreen-текстуру в [`Canvas`] (`memfd`).
+    /// Lets the wallpaper draw its scene, then copies the offscreen texture into the [`Canvas`] (`memfd`).
     ///
-    /// Копия кадра `N` отправляется в свободный слот пула и НЕ дожидается на месте:
-    /// за кадр выдаётся уже посчитанный кадр `N-1` (`StagingPool::deliver_oldest`).
+    /// The copy of frame `N` goes into a free pool slot and is NOT awaited in place: each
+    /// frame delivers the already computed `N-1` (`StagingPool::deliver_oldest`).
     fn render_frame<S: GpuSceneWallpaper>(
         &mut self,
         inner: &mut S,
@@ -786,7 +790,7 @@ impl WgpuScenePipeline {
     ) -> Result<bool> {
         self.resize_if_needed(ctx.width, ctx.height);
 
-        // Слот-приёмник копии этого кадра; попутно пул может выдать в canvas кадр N-1.
+        // Slot that receives this frame's copy; the pool may also deliver frame N-1 to the canvas.
         let slot = self.pool.begin_frame(&self.device, canvas)?;
 
         let mut encoder = self
@@ -795,7 +799,7 @@ impl WgpuScenePipeline {
                 label: Some("rwallpprs-scene-encoder"),
             });
 
-        // Отдаём обои собственный encoder и target; они пишут туда свои render pass'ы.
+        // Hand the wallpaper its own encoder and target; it writes its render passes there.
         let changed = {
             let mut scene = GpuScene {
                 device: &self.device,
@@ -838,10 +842,10 @@ impl WgpuScenePipeline {
     }
 }
 
-/// Записывает текущий кадр в PPM (`P6`) для визуальной проверки без запуска демона.
+/// Writes the current frame to a PPM (`P6`) for visual inspection without running the daemon.
 ///
-/// Путь берётся из env-переменной `RWALLPPRS_DUMP_PPM` (см. [`SceneWallpaperAdapter`]).
-/// Пиксели [`Canvas`] хранятся в `BGRA` (Little-Endian `ARGB8888`), в PPM кладём `RGB` без альфы.
+/// The path comes from the `RWALLPPRS_DUMP_PPM` environment variable (see [`SceneWallpaperAdapter`]).
+/// [`Canvas`] pixels are stored as `BGRA` (little-endian `ARGB8888`); the PPM gets `RGB` without alpha.
 fn write_ppm_dump(path: &str, width: u32, height: u32, pixels: &[u32]) -> std::io::Result<()> {
     let count = (width as usize) * (height as usize);
     let mut buf = Vec::with_capacity(32 + count * 3);
@@ -854,8 +858,8 @@ fn write_ppm_dump(path: &str, width: u32, height: u32, pixels: &[u32]) -> std::i
     std::fs::write(path, buf)
 }
 
-/// Адаптер, превращающий любой [`GpuSceneWallpaper`] в стандартный [`Wallpaper`] с ленивой
-/// инициализацией GPU и автоматическим фоллбэком на CPU, если Vulkan/GL недоступен.
+/// Adapter turning any [`GpuSceneWallpaper`] into a standard [`Wallpaper`], with lazy GPU
+/// initialization and automatic CPU fallback when Vulkan/GL is unavailable.
 pub struct SceneWallpaperAdapter<S: GpuSceneWallpaper> {
     inner: S,
     gpu: Option<WgpuScenePipeline>,
@@ -892,14 +896,14 @@ impl<S: GpuSceneWallpaper> Wallpaper for SceneWallpaperAdapter<S> {
             match pollster::block_on(WgpuScenePipeline::new_async(ctx.width, ctx.height)) {
                 Ok(gpu) => {
                     eprintln!(
-                        "[rwallpprs-sdk] WGPU (Vulkan/GL) сценовый конвейер успешно инициализирован ({}x{})",
+                        "[rwallpprs-sdk] WGPU (Vulkan/GL) scene pipeline initialized successfully ({}x{})",
                         ctx.width, ctx.height
                     );
                     self.gpu = Some(gpu);
                 }
                 Err(e) => {
                     eprintln!(
-                        "[rwallpprs-sdk] WGPU недоступен ({}), используется CPU-рендерер",
+                        "[rwallpprs-sdk] WGPU unavailable ({}), using the CPU renderer",
                         e
                     );
                 }
@@ -913,7 +917,7 @@ impl<S: GpuSceneWallpaper> Wallpaper for SceneWallpaperAdapter<S> {
                 Ok(frame_changed) => changed = frame_changed,
                 Err(e) => {
                     eprintln!(
-                        "[rwallpprs-sdk] Ошибка сценового GPU-конвейера ({}), переход на CPU-рендерер",
+                        "[rwallpprs-sdk] Scene GPU pipeline error ({}), falling back to the CPU renderer",
                         e
                     );
                     self.gpu = None;
@@ -921,7 +925,7 @@ impl<S: GpuSceneWallpaper> Wallpaper for SceneWallpaperAdapter<S> {
             }
         }
 
-        // GPU не инициализировался или отвалился — рисуем минимальную CPU-картинку.
+        // The GPU never initialized or died — draw a minimal CPU image.
         if self.gpu.is_none() {
             self.inner.fallback_cpu_render(ctx, canvas);
             changed = true;
@@ -929,7 +933,7 @@ impl<S: GpuSceneWallpaper> Wallpaper for SceneWallpaperAdapter<S> {
 
         if let Some(path) = self.ppm_dump_path.take() {
             if let Err(e) = write_ppm_dump(&path, ctx.width, ctx.height, canvas.pixels_mut()) {
-                eprintln!("[rwallpprs-sdk] Не удалось записать PPM-дамп '{}': {}", path, e);
+                eprintln!("[rwallpprs-sdk] Failed to write the PPM dump '{}': {}", path, e);
             } else {
                 self.ppm_dump_path = Some(path);
             }

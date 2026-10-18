@@ -1,15 +1,15 @@
-//! Протокол взаимодействия между:
-//! 1. `rwallpprs` (CLI) <-> `rwallpprs-daemon` (управляющий UNIX-сокет, префикс длины u32 + bincode/JSON)
-//! 2. `rwallpprs-daemon` <-> Скомпилированный Rust-бинарник обоев (POSIX SHM + event pipe)
+//! Protocol used between:
+//! 1. `rwallpprs` (CLI) <-> `rwallpprs-daemon` (control UNIX socket, u32 length prefix + bincode)
+//! 2. `rwallpprs-daemon` <-> compiled Rust wallpaper binary (POSIX SHM + event pipe)
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-/// Магическая подпись для бинарников обоев, вшитых прямо внутрь CLI-файла.
+/// Magic signature for wallpaper binaries embedded directly inside the CLI file.
 pub const EMBEDDED_BIN_MAGIC: &[u8; 18] = b"RWALLPPRS_EMBED_V2";
 
-/// Поддерживаемые видеокодеки.
+/// Supported video codecs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
@@ -20,7 +20,7 @@ pub enum VideoCodec {
     Other,
 }
 
-/// Аппаратный бэкенд декодирования видео для `ffmpeg-next` (`AVHWDeviceType`).
+/// Hardware video decoding backend for `ffmpeg-next` (`AVHWDeviceType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HwAccelBackend {
@@ -33,7 +33,7 @@ pub enum HwAccelBackend {
     Software,
 }
 
-/// Режим масштабирования изображения/видео на мониторе.
+/// Scale mode for images/video on the monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ScaleMode {
@@ -43,20 +43,20 @@ pub enum ScaleMode {
     Stretch,
 }
 
-/// Режим работы скомпилированных Rust-обоев.
+/// Run mode of a compiled Rust wallpaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RustWallpaperMode {
-    /// Постоянный рендер с заданным FPS (анимированные процедурные или WGPU-шейдерные обои).
+    /// Continuous rendering at the configured FPS (animated procedural or WGPU shader wallpapers).
     #[default]
     Animated,
-    /// Рендер ровно 1 кадра при старте или смене разрешения монитора (0% CPU/GPU в простое).
+    /// Render exactly one frame at startup or on monitor resolution change (0% CPU/GPU while idle).
     Static,
-    /// Рендер только при приходе событий от композитора Niri (скролл ленты, смена воркспейса, Overview).
+    /// Render only when events arrive from the Niri compositor (strip scroll, workspace change, Overview).
     ReactiveNiri,
 }
 
-/// Настройки энергосбережения и автоскрытия под Niri.
+/// Power saving and auto-hide settings for Niri.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PowerSavePolicy {
     pub enabled: bool,
@@ -82,10 +82,10 @@ impl Default for PowerSavePolicy {
     }
 }
 
-/// Управляющие команды от CLI к демону `rwallpprs-daemon`.
+/// Control commands from the CLI to `rwallpprs-daemon`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlCommand {
-    /// Установить видео-обои (декодируются нативно через `ffmpeg-next`).
+    /// Set video wallpaper (decoded natively through `ffmpeg-next`).
     SetVideo {
         path: PathBuf,
         output: Option<String>,
@@ -93,7 +93,7 @@ pub enum ControlCommand {
         fps_limit: u32,
         scale: ScaleMode,
     },
-    /// Запустить внешний скомпилированный бинарник Rust-обоев с диска.
+    /// Run an external compiled Rust wallpaper binary from disk.
     SetRustBin {
         bin_path: PathBuf,
         args: Vec<String>,
@@ -101,7 +101,7 @@ pub enum ControlCommand {
         mode: RustWallpaperMode,
         fps: u32,
     },
-    /// Передать вложенный в CLI ELF-бинарник обоев напрямую в память демона (`memfd_create` на стороне демона).
+    /// Hand an ELF wallpaper binary embedded in the CLI straight into daemon memory (`memfd_create` on the daemon side).
     SetEmbeddedBin {
         name: String,
         elf_payload: Vec<u8>,
@@ -110,17 +110,17 @@ pub enum ControlCommand {
         mode: RustWallpaperMode,
         fps: u32,
     },
-    /// Обновить политику автоскрытия и энергосбережения на лету.
+    /// Update the auto-hide and power saving policy at runtime.
     UpdatePowerPolicy(PowerSavePolicy),
-    /// Принудительно переключить паузу.
+    /// Force a pause toggle.
     TogglePause,
-    /// Запросить телеметрию и статус всех мониторов.
+    /// Request telemetry and status for every monitor.
     GetStatus,
-    /// Остановить демон.
+    /// Shut the daemon down.
     Shutdown,
 }
 
-/// Ответ демона для CLI.
+/// Daemon reply for the CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
     Ok { message: String },
@@ -128,8 +128,8 @@ pub enum ControlResponse {
     Error { reason: String },
 }
 
-/// Надёжная фреймированная отправка сообщения по сокету (u32 LE длина + bincode payload).
-/// Позволяет передавать как легкие команды, так и многомегабайтные ELF-бинарники в `SetEmbeddedBin`.
+/// Reliable framed message write over a socket (u32 LE length + bincode payload).
+/// Carries both small commands and multi-megabyte ELF binaries in `SetEmbeddedBin`.
 pub fn write_framed_msg<W: Write, T: Serialize>(mut writer: W, msg: &T) -> std::io::Result<()> {
     let bytes = bincode::serialize(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -146,7 +146,7 @@ pub fn read_framed_msg<R: Read, T: for<'de> Deserialize<'de>>(mut reader: R) -> 
     if len > 256 * 1024 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Превышен лимит размера IPC-сообщения (256 МБ)",
+            "IPC message size limit exceeded (256 MB)",
         ));
     }
     let mut payload = vec![0u8; len];
@@ -184,21 +184,21 @@ pub enum PowerRuntimeState {
     UserPaused,
 }
 
-/// Живое состояние композитора Niri, синхронизированное через официальный крейт `niri-ipc`.
+/// Client state of the Niri compositor, synchronized through the official `niri-ipc` crate.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NiriViewportState {
     pub active_workspace_id: u64,
     pub active_workspace_idx: u32,
     pub overview_open: bool,
     pub has_fullscreen_window: bool,
-    /// Доля ширины экрана (0.0..=1.0), занимаемая активным сфокусированным окном на текущем воркспейсе.
+    /// Fraction of screen width (0.0..=1.0) occupied by the active focused window on the current workspace.
     pub focused_window_width_ratio: f32,
-    /// Доля ширины экрана (0.0..=1.0), покрытая окнами активного воркспейса
-    /// (сумма ширин колонок ленты Niri): 1 окно на весь экран, 2-3 окна, вместе
-    /// закрывающие экран, или стопка окон дают значение около 1.0.
+    /// Fraction of screen width (0.0..=1.0) covered by windows on the active workspace
+    /// (sum of Niri scrolling-strip column widths): a single fullscreen window, two or three
+    /// windows that together fill the screen, or a stack of windows all approach 1.0.
     pub screen_coverage_ratio: f32,
     pub visible_windows_count: u32,
-    /// Относительное горизонтальное смещение в тайлинговой ленте Niri (индекс колонки + сдвиг пикселей).
+    /// Relative horizontal offset within the Niri tiling strip (column index + pixel shift).
     pub strip_scroll_offset: f64,
     pub cursor_uv: (f32, f32),
 }
@@ -229,7 +229,7 @@ pub enum WorkerAck {
     FrameSkipped { frame_index: u64 },
 }
 
-/// Заголовок в начале POSIX Shared Memory (`memfd`) буфера.
+/// Header at the start of the POSIX shared memory (`memfd`) buffer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ShmBufferHeader {

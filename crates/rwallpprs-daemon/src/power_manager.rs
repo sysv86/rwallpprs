@@ -1,10 +1,10 @@
-//! Модуль энергосбережения и автоматического скрытия обоев.
+//! Power saving and automatic wallpaper hiding.
 //!
-//! Опирается на:
-//! 1. Реальную долю ширины активной колонки Niri (`focused_window_width_ratio >= policy.maximized_column_threshold`).
-//! 2. Полноэкранный статус (`has_fullscreen_window`).
-//! 3. Открытие режима Niri Overview (`overview_open`).
-//! 4. Уровень заряда батареи из `/sys/class/power_supply/BAT*`.
+//! Decisions are based on:
+//! 1. The real width fraction of the active Niri column (`focused_window_width_ratio >= policy.maximized_column_threshold`).
+//! 2. Fullscreen state (`has_fullscreen_window`).
+//! 3. Whether Niri Overview is open (`overview_open`).
+//! 4. Battery charge level from `/sys/class/power_supply/BAT*`.
 
 use rwallpprs_ipc::{
     NiriViewportState, PowerRuntimeState, PowerSavePolicy, RustWallpaperMode,

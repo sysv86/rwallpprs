@@ -1,11 +1,11 @@
-//! Супервизор скомпилированных бинарников Rust-обоев (`RustWallpaperRunner`).
+//! Supervisor for compiled Rust wallpaper binaries (`RustWallpaperRunner`).
 //!
-//! Улучшения `v0.2.0-beta.1`:
-//! 1. Использует безопасные вызовы [`rustix::fs::memfd_create`], [`rustix::fs::ftruncate`] и [`rustix::mm::mmap`].
-//! 2. Поддерживает хранение **вложенного ELF-образа (`embedded_elf_fd: Option<OwnedFd>`)** прямо внутри демона!
-//!    Когда пользователь вызывает `rwallpprs run-embedded`, демон сам создает долгоживущий `memfd` с ELF-кодом
-//!    обоев и запускает `/proc/self/fd/<fd>`, поэтому CLI может завершиться мгновенно, а демон способен
-//!    перезапускать вложенный бинарник в любой момент.
+//! `v0.2.0-beta.1` changes:
+//! 1. Uses the safe wrappers [`rustix::fs::memfd_create`], [`rustix::fs::ftruncate`] and [`rustix::mm::mmap`].
+//! 2. Keeps the **embedded ELF image (`embedded_elf_fd: Option<OwnedFd>`)** alive inside the daemon.
+//!    When the user runs `rwallpprs run-embedded`, the daemon creates a long-lived `memfd` holding the
+//!    wallpaper ELF and executes `/proc/self/fd/<fd>`, so the CLI can exit immediately while the daemon
+//!    stays able to restart the embedded binary at any time.
 
 use anyhow::{Context, Result};
 use rustix::{
@@ -34,7 +34,7 @@ pub struct RustWallpaperRunner {
     shm_fd: OwnedFd,
     shm_ptr: NonNull<u8>,
     shm_size: usize,
-    /// Если обои запущены через `run-embedded`, этот `OwnedFd` удерживает их ELF-образ в RAM демона.
+    /// Holds the ELF image of a wallpaper started via `run-embedded` in daemon RAM.
     _embedded_elf_fd: Option<OwnedFd>,
     child: Child,
     child_stdin: ChildStdin,
@@ -50,7 +50,7 @@ pub struct RustWallpaperRunner {
 unsafe impl Send for RustWallpaperRunner {}
 
 impl RustWallpaperRunner {
-    /// Запускает внешний скомпилированный бинарник Rust-обоев по пути на диске.
+    /// Runs an external compiled Rust wallpaper binary from a path on disk.
     pub fn spawn_from_path(
         bin_path: PathBuf,
         args: Vec<String>,
@@ -60,13 +60,13 @@ impl RustWallpaperRunner {
         height: u32,
     ) -> Result<Self> {
         if !bin_path.exists() {
-            anyhow::bail!("Бинарник Rust-обоев не найден: {:?}", bin_path);
+            anyhow::bail!("Rust wallpaper binary not found: {:?}", bin_path);
         }
         let display_name = bin_path.display().to_string();
         Self::spawn_internal(display_name, bin_path, None, args, mode, target_fps, width, height)
     }
 
-    /// Запускает вложенный в CLI ELF-бинарник обоев напрямую из памяти демона (`memfd_create`).
+    /// Runs a wallpaper ELF binary embedded in the CLI straight from daemon memory (`memfd_create`).
     pub fn spawn_from_embedded_elf(
         name: String,
         elf_payload: &[u8],
@@ -76,19 +76,18 @@ impl RustWallpaperRunner {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        // Создаем долгоживущий memfd в адресном пространстве демона с флагом CLOEXEC
         let elf_fd = memfd_create("rwallpprs-embedded-elf", MemfdFlags::CLOEXEC)
-            .context("Не удалось создать memfd для вложенного ELF-образа обоев")?;
+            .context("Failed to create a memfd for the embedded wallpaper ELF image")?;
 
         let mut elf_file = std::fs::File::from(elf_fd);
         elf_file
             .write_all(elf_payload)
-            .context("Не удалось записать ELF-образ в memfd демона")?;
+            .context("Failed to write the ELF image into the daemon memfd")?;
         elf_file.flush()?;
         let elf_fd: OwnedFd = elf_file.into();
 
         let exec_path = PathBuf::from(format!("/proc/self/fd/{}", elf_fd.as_raw_fd()));
-        let display_name = format!("embedded:{} ({} КБ в RAM)", name, elf_payload.len() / 1024);
+        let display_name = format!("embedded:{} ({} KB in RAM)", name, elf_payload.len() / 1024);
 
         Self::spawn_internal(
             display_name,
@@ -116,14 +115,14 @@ impl RustWallpaperRunner {
         let header = ShmBufferHeader::new(width, height);
         let shm_size = header.total_shm_size();
 
-        // Создаем буфер кадров в разделяемой памяти без CLOEXEC, чтобы дочерний процесс унаследовал FD
+        // Frame buffer in shared memory without CLOEXEC so the child process inherits the FD
         let shm_fd = memfd_create("rwallpprs-shm-framebuf", MemfdFlags::empty())
-            .context("Ошибка вызова rustix::fs::memfd_create для кадрового буфера")?;
+            .context("rustix::fs::memfd_create failed for the frame buffer")?;
 
         ftruncate(&shm_fd, shm_size as u64)
-            .context("Ошибка rustix::fs::ftruncate для SHM буфера")?;
+            .context("rustix::fs::ftruncate failed for the SHM buffer")?;
 
-        // Сбрасываем FD_CLOEXEC явно для передаваемого SHM дескриптора
+        // Clear FD_CLOEXEC explicitly on the SHM descriptor we hand over
         let flags = fcntl_getfd(&shm_fd)?;
         fcntl_setfd(&shm_fd, flags.difference(FdFlags::CLOEXEC))?;
 
@@ -136,10 +135,10 @@ impl RustWallpaperRunner {
                 &shm_fd,
                 0,
             )
-            .context("Ошибка rustix::mm::mmap в демоне")?
+            .context("rustix::mm::mmap failed in the daemon")?
         };
         let shm_ptr = NonNull::new(raw_ptr.cast::<u8>())
-            .ok_or_else(|| anyhow::anyhow!("mmap вернул нулевой указатель"))?;
+            .ok_or_else(|| anyhow::anyhow!("mmap returned a null pointer"))?;
 
         unsafe {
             std::ptr::write(shm_ptr.as_ptr().cast::<ShmBufferHeader>(), header);
@@ -155,21 +154,21 @@ impl RustWallpaperRunner {
 
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("Не удалось запустить Rust-обои {}", display_name))?;
+            .with_context(|| format!("Failed to launch Rust wallpaper {}", display_name))?;
 
         let child_stdin = child
             .stdin
             .take()
-            .context("Не удалось получить stdin дочернего процесса")?;
+            .context("Failed to take the child process stdin")?;
         let child_stdout = BufReader::new(
             child
                 .stdout
                 .take()
-                .context("Не удалось получить stdout дочернего процесса")?,
+                .context("Failed to take the child process stdout")?,
         );
 
         info!(
-            "Запущены Rust-обои {} (PID={}, mode={:?}, SHM={} КБ)",
+            "Started Rust wallpaper {} (PID={}, mode={:?}, SHM={} KB)",
             display_name,
             child.id(),
             mode,
@@ -205,16 +204,16 @@ impl RustWallpaperRunner {
         self.child.id()
     }
 
-    /// Raw FD `memfd` кадрового буфера движка (zero-copy direct present поверх
-    /// того же файла: демон импортирует его в `wl_shm` без копий пикселей).
-    /// Runner всегда владеет этим memfd, поэтому `RawFd` без `Option`.
+    /// Raw FD of the engine frame-buffer `memfd` (zero-copy direct present over the
+    /// same file: the daemon imports it into `wl_shm` without copying pixels).
+    /// The runner always owns this memfd, so the `RawFd` is not optional.
     pub fn shm_raw_fd(&self) -> RawFd {
         self.shm_fd.as_raw_fd()
     }
 
-    /// Слот, который будет использован для **следующего** кадра — без продвижения
-    /// `current_slot`. Нужен flow-control'у главного цикла: перед отправкой
-    /// `RenderFrame` проверяется, освободил ли композитор этот слот.
+    /// Slot that will be used for the **next** frame, without advancing
+    /// `current_slot`. Used by main-loop flow control: before sending
+    /// `RenderFrame` it checks whether the compositor released that slot.
     pub fn peek_next_slot(&self) -> u8 {
         self.current_slot
     }
@@ -274,7 +273,7 @@ impl RustWallpaperRunner {
         let mut line = String::new();
         self.child_stdout.read_line(&mut line)?;
         if line.trim().is_empty() {
-            anyhow::bail!("Процесс Rust-обоев закрыл канал ответа");
+            anyhow::bail!("The Rust wallpaper process closed its reply pipe");
         }
 
         let ack: WorkerAck = serde_json::from_str(&line)?;
@@ -286,8 +285,8 @@ impl RustWallpaperRunner {
                 let frame_slice = unsafe {
                     std::slice::from_raw_parts(self.shm_ptr.as_ptr().add(offset), byte_len)
                 };
-                // Возвращаем слот вместе со срезом: direct-present привязывает
-                // wl_buffer к этому же офсету (нулевое копирование через SHM)
+                // Return the slot together with the slice: direct present binds the
+                // wl_buffer to this exact offset (zero copy through SHM)
                 Ok(Some((slot, frame_slice)))
             }
             WorkerAck::FrameSkipped { .. } => Ok(None),
@@ -324,7 +323,7 @@ impl Drop for RustWallpaperRunner {
             let _ = munmap(self.shm_ptr.as_ptr().cast(), self.shm_size);
         }
         warn!(
-            "Процесс Rust-обоев {} остановлен, ресурсы SHM освобождены",
+            "Rust wallpaper process {} stopped, SHM resources released",
             self.display_name
         );
     }

@@ -1,13 +1,13 @@
-# Конфигурация RWallpprs v0.2.0-beta.1 для Niri (Arch Linux)
+# RWallpprs v0.2.0-beta.1 configuration for Niri (Arch Linux)
 
 [general]
 layer = "background"
 log_level = "info"
 
 [video]
-# Аппаратный декодер libavcodec: "auto" | "vaapi" | "vulkan" | "nvdec" | "vdpau" | "software"
+# Hardware decoder backend for libavcodec: "auto" | "vaapi" | "vulkan" | "nvdec" | "vdpau" | "software"
 hw_accel = "auto"
-# Путь к DRM render-ноде для VA-API
+# DRM render node used by VA-API
 drm_render_node = "/dev/dri/renderD128"
 scale_mode = "fill"
 fps_limit = 60
@@ -24,7 +24,7 @@ enabled = true
 auto_hide_surface = true
 pause_on_fullscreen = true
 pause_on_maximized_column = true
-# Доля ширины монитора (0.0..=1.0), при которой активная колонка Niri считается полностью перекрывающей фон
+# Fraction of monitor width (0.0..=1.0) at which the active Niri column is considered to cover the whole background
 maximized_column_threshold = 0.96
 wake_on_niri_overview = true
 battery_freeze_threshold = 25

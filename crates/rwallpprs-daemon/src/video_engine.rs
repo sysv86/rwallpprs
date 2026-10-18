@@ -1,14 +1,14 @@
-//! Нативный аппаратный декодер видео на базе крейтов [`ffmpeg_next`] и [`ffmpeg_sys_next`].
+//! Native hardware video decoder built on the [`ffmpeg_next`] and [`ffmpeg_sys_next`] crates.
 //!
-//! Полностью заменяет внешний CLI-процесс `ffmpeg`:
-//! - Демультиплексирование контейнеров (`.mp4`, `.mkv`, `.webm`) через `ffmpeg_next::format::input`.
-//! - Поддержка кодеков **H.264**, **HEVC (H.265)**, **VP9** и **AV1**.
-//! - Инициализация аппаратного контекста `AVHWDeviceType` (`VA-API` на `/dev/dri/renderD128`,
-//!   `Vulkan`, `CUDA/NVDEC`, `VDPAU`) через `av_hwdevice_ctx_create` с автоматическим фоллбэком
-//!   на многопоточный программный декодер (`libdav1d` / `ff_h264`).
-//! - Выгрузка аппаратных поверхностей через `av_hwframe_transfer_data` и цветовое преобразование +
-//!   масштабирование через `ffmpeg_next::software::scaling::Context` (`libswscale`) напрямую
-//!   в срез `BGRA` (`wl_shm::Format::Xrgb8888`) без промежуточных буферов.
+//! Fully replaces the external `ffmpeg` CLI process:
+//! - Container demuxing (`.mp4`, `.mkv`, `.webm`) through `ffmpeg_next::format::input`.
+//! - Codec support for **H.264**, **HEVC (H.265)**, **VP9** and **AV1**.
+//! - Hardware context creation for `AVHWDeviceType` (`VA-API` on `/dev/dri/renderD128`,
+//!   `Vulkan`, `CUDA/NVDEC`, `VDPAU`) through `av_hwdevice_ctx_create`, with automatic fallback
+//!   to the multithreaded software decoder (`libdav1d` / `ff_h264`).
+//! - Hardware surface download through `av_hwframe_transfer_data`, then color conversion and
+//!   scaling through `ffmpeg_next::software::scaling::Context` (`libswscale`) directly into a
+//!   `BGRA` slice (`wl_shm::Format::Xrgb8888`) with no intermediate buffers.
 
 use anyhow::{Context as AnyhowContext, Result};
 use ffmpeg_next::{
@@ -46,7 +46,7 @@ pub struct VideoWallpaperEngine {
     decoded_frame: VideoFrame,
     sw_transfer_frame: VideoFrame,
     scaled_bgra_frame: VideoFrame,
-    /// Уже отправляли decoder.send_eof() — drain проделан, вход исчерпан.
+    /// `decoder.send_eof()` has already been called — the drain is done, input is exhausted.
     eof_flushed: bool,
 }
 
@@ -61,15 +61,15 @@ impl VideoWallpaperEngine {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        ffmpeg_next::init().context("Не удалось инициализировать библиотеки FFmpeg (ffmpeg-next)")?;
+        ffmpeg_next::init().context("Failed to initialize the FFmpeg libraries (ffmpeg-next)")?;
 
         let ictx = format::input(&path)
-            .with_context(|| format!("Не удалось открыть видеоконтейнер {:?}", path))?;
+            .with_context(|| format!("Failed to open video container {:?}", path))?;
 
         let stream = ictx
             .streams()
             .best(MediaType::Video)
-            .ok_or_else(|| anyhow::anyhow!("В контейнере {:?} не найден видеопоток", path))?;
+            .ok_or_else(|| anyhow::anyhow!("No video stream found in container {:?}", path))?;
 
         let video_stream_index = stream.index();
         let codec_params = stream.parameters();
@@ -84,23 +84,23 @@ impl VideoWallpaperEngine {
         };
 
         let mut codec_context = codec::context::Context::from_parameters(codec_params)
-            .context("Не удалось создать контекст декодера из параметров потока")?;
+            .context("Failed to create a decoder context from stream parameters")?;
 
-        // Многопоточное декодирование на случай программного фоллбэка (например, dav1d / hevc)
+        // Multithreaded decoding as a safeguard for the software fallback (e.g. dav1d / hevc)
         unsafe {
             (*codec_context.as_mut_ptr()).thread_count = 0; // auto threads
         }
 
-        // Попытка привязать аппаратный контекст VA-API / Vulkan / NVDEC / VDPAU
+        // Try to attach a VA-API / Vulkan / NVDEC / VDPAU hardware context
         let hw_device_ctx = Self::try_init_hw_device(&mut codec_context, hw_accel);
 
         let decoder = codec_context
             .decoder()
             .video()
-            .context("Не удалось открыть видеодекодер libavcodec")?;
+            .context("Failed to open the libavcodec video decoder")?;
 
         info!(
-            "Открыт нативный декодер ffmpeg-next: файл={:?}, кодек={:?} ({:?}), исходный размер={}x{}, целевой={}x{}@{}fps, hw_ctx_active={}",
+            "Opened native ffmpeg-next decoder: file={:?}, codec={:?} ({:?}), source size={}x{}, target={}x{}@{}fps, hw_ctx_active={}",
             path,
             detected_codec,
             decoder.id(),
@@ -134,9 +134,9 @@ impl VideoWallpaperEngine {
         })
     }
 
-    /// Инициализирует `AVHWDeviceContext` (`VAAPI` / `VULKAN` / `CUDA` / `VDPAU`) и прикрепляет
-    /// его к `AVCodecContext`. Если выбранный аппаратный бэкенд недоступен, возвращает `null_mut()`
-    /// для бесшовного фоллбэка на CPU-декодер.
+    /// Initializes an `AVHWDeviceContext` (`VAAPI` / `VULKAN` / `CUDA` / `VDPAU`) and attaches it to
+    /// the `AVCodecContext`. If the requested backend is unavailable it returns `null_mut()` so the
+    /// caller can fall back to the CPU decoder.
     fn try_init_hw_device(
         codec_ctx: &mut codec::context::Context,
         hw: HwAccelBackend,
@@ -179,13 +179,13 @@ impl VideoWallpaperEngine {
                 unsafe {
                     (*codec_ctx.as_mut_ptr()).hw_device_ctx = av_buffer_ref(hw_ctx);
                 }
-                info!("Активировано аппаратное ускорение FFmpeg: {:?}", dev_type);
+                info!("FFmpeg hardware acceleration enabled: {:?}", dev_type);
                 return hw_ctx;
             }
         }
 
         warn!(
-            "Аппаратный декодер {:?} недоступен на данном GPU, используется многопоточный программный декодер libavcodec",
+            "Hardware decoder {:?} unavailable on this GPU, using the multithreaded libavcodec software decoder",
             hw
         );
         ptr::null_mut()
@@ -202,7 +202,7 @@ impl VideoWallpaperEngine {
         )
     }
 
-    /// Обновляет целевое разрешение кадра при реконфигурации монитора в Niri.
+    /// Updates the target frame size after a monitor reconfiguration in Niri.
     pub fn resize_output(&mut self, new_width: u32, new_height: u32) {
         if self.width == new_width && self.height == new_height {
             return;
@@ -213,7 +213,7 @@ impl VideoWallpaperEngine {
         self.sws_scaler = None;
     }
 
-    /// Декодирует ровно один видеокадр и копирует его в `dest_bgra` (`XRGB8888` для `wl_shm`).
+    /// Decodes exactly one video frame and copies it into `dest_bgra` (`XRGB8888` for `wl_shm`).
     pub fn decode_next_frame(&mut self, dest_bgra: &mut [u8]) -> Result<bool> {
         if self.paused {
             return Ok(false);
@@ -221,17 +221,17 @@ impl VideoWallpaperEngine {
 
         let expected_bytes = (self.width as usize) * (self.height as usize) * 4;
         if dest_bgra.len() < expected_bytes {
-            anyhow::bail!("Целевой буфер wl_shm меньше размера кадра BGRA");
+            anyhow::bail!("Destination wl_shm buffer is smaller than the BGRA frame");
         }
 
         loop {
-            // 1. Сначала проверяем, есть ли уже готовый кадр в очереди декодера
+            // 1. First check whether the decoder already has a frame queued
             if self.decoder.receive_frame(&mut self.decoded_frame).is_ok() {
                 self.convert_decoded_frame_to_bgra(dest_bgra)?;
                 return Ok(true);
             }
 
-            // 2. Читаем следующий пакет из контейнера
+            // 2. Read the next packet from the container
             let mut packet_fed = false;
             for (stream, packet) in self.ictx.packets() {
                 if stream.index() == self.video_stream_index {
@@ -241,23 +241,23 @@ impl VideoWallpaperEngine {
                 }
             }
 
-            // 3. Если достигнут конец файла — сливаем хвост декодера и
-            //    пересоздаём вход+декодер целиком. Практика показала, что
-            //    `Input::seek(0, ..0)` в ffmpeg-next 9 после EOF возвращает
-            //    Ok, но пайплайн декодера остаётся мёртвым — поэтому
-            //    guarantee только один: свежий контейнер и свежий декодер.
+            // 3. At end of file, flush the decoder tail and recreate both
+            //    the input and the decoder. In practice `Input::seek(0, ..0)`
+            //    in ffmpeg-next 9 returns Ok after EOF but leaves the decode
+            //    pipeline dead, so the only reliable guarantee is a fresh
+            //    container and a fresh decoder.
             if !packet_fed {
                 if !self.eof_flushed {
                     self.decoder.send_eof()?;
                     self.eof_flushed = true;
-                    // Один кадр из drain-буфера декодера отдаем на этом же тике,
-                    // чтобы не мигало на месте стыка лупа
+                    // Hand one frame from the decoder drain buffer to this same tick
+                    // so the loop seam does not flicker
                     if self.decoder.receive_frame(&mut self.decoded_frame).is_ok() {
                         self.convert_decoded_frame_to_bgra(dest_bgra)?;
                         return Ok(true);
                     }
                 }
-                // Вход исчерпан, декодер выдохся — перезапуск движка (луп видео)
+                // Input exhausted and decoder drained — restart the engine (video loop)
                 let old_paused = self.paused;
                 *self = VideoWallpaperEngine::new(
                     self.path.clone(),
@@ -278,7 +278,7 @@ impl VideoWallpaperEngine {
             std::mem::transmute::<i32, AVPixelFormat>((*self.decoded_frame.as_ptr()).format)
         };
 
-        // Если кадр находится в видеопамяти VA-API / Vulkan / CUDA, переносим его в системную RAM (NV12/YUV420P)
+        // If the frame lives in VA-API / Vulkan / CUDA video memory, download it to system RAM (NV12/YUV420P)
         let src_frame: &VideoFrame = if Self::is_hw_pixel_format(raw_fmt) {
             let ret = unsafe {
                 av_hwframe_transfer_data(
@@ -288,7 +288,7 @@ impl VideoWallpaperEngine {
                 )
             };
             if ret < 0 {
-                anyhow::bail!("Ошибка av_hwframe_transfer_data (код {})", ret);
+                anyhow::bail!("av_hwframe_transfer_data failed (code {})", ret);
             }
             &self.sw_transfer_frame
         } else {
@@ -313,7 +313,7 @@ impl VideoWallpaperEngine {
                 self.height,
                 flags,
             )
-            .context("Не удалось инициализировать SwsContext для конвертации в BGRA")?;
+            .context("Failed to initialize SwsContext for BGRA conversion")?;
             self.sws_scaler = Some(scaler);
             self.last_src_format = Some((src_fmt, src_w, src_h));
         }
@@ -321,7 +321,7 @@ impl VideoWallpaperEngine {
         let scaler = self.sws_scaler.as_mut().unwrap();
         scaler.run(src_frame, &mut self.scaled_bgra_frame)?;
 
-        // Копируем строки с учетом выравнивания linesize (stride) FFmpeg
+        // Copy rows honoring the FFmpeg linesize (stride) alignment
         let src_stride = self.scaled_bgra_frame.stride(0);
         let dst_row_bytes = (self.width as usize) * 4;
         let data = self.scaled_bgra_frame.data(0);

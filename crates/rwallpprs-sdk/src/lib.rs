@@ -1,11 +1,11 @@
 //! # RWallpprs SDK (`v0.2.0-beta.1`)
 //!
-//! Специальное API для написания обоев под композитор **Niri** на чистом **Rust**:
-//! - **На GPU (`wgpu` + WGSL шейдеры)**: через типаж [`GpuShaderWallpaper`] и макрос [`run_shader_wallpaper!`].
-//! - **На GPU (полноценные 2D-сцены)**: через типаж [`GpuSceneWallpaper`], контекст [`GpuScene`]
-//!   и макрос [`run_scene_wallpaper!`] — собственные пайплайны, буферы, инстансинг.
-//! - **На CPU (`Canvas` zero-copy SHM)**: через типаж [`Wallpaper`] и макрос [`run_wallpaper!`].
-//! - Все операции с разделяемой памятью (`RWALLPPRS_SHM_FD`) используют безопасные обертки [`rustix::mm::mmap`].
+//! Purpose-built API for writing wallpapers for the **Niri** compositor in plain **Rust**:
+//! - **On the GPU (`wgpu` + WGSL shaders)**: through the [`GpuShaderWallpaper`] trait and the [`run_shader_wallpaper!`] macro.
+//! - **On the GPU (full 2D scenes)**: through the [`GpuSceneWallpaper`] trait, the [`GpuScene`] context
+//!   and the [`run_scene_wallpaper!`] macro — custom pipelines, buffers, instancing.
+//! - **On the CPU (`Canvas`, zero-copy SHM)**: through the [`Wallpaper`] trait and the [`run_wallpaper!`] macro.
+//! - All shared memory operations (`RWALLPPRS_SHM_FD`) use the safe [`rustix::mm::mmap`] wrappers.
 
 pub mod wgpu_renderer;
 
@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{BorrowedFd, RawFd};
 use std::ptr::NonNull;
 
-/// Цвет пикселя в формате Wayland `ARGB8888` / `XRGB8888` (Little-Endian: `[B, G, R, A]`).
+/// Pixel color in Wayland `ARGB8888` / `XRGB8888` layout (little-endian: `[B, G, R, A]`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Color {
@@ -72,7 +72,7 @@ impl Color {
     }
 }
 
-/// Контекст кадра, передаваемый в метод `Wallpaper::render`.
+/// Frame context passed to `Wallpaper::render`.
 #[derive(Debug, Clone)]
 pub struct FrameContext {
     pub frame_index: u64,
@@ -83,7 +83,7 @@ pub struct FrameContext {
     pub niri: NiriViewportState,
 }
 
-/// Быстрый холст (`Canvas`), смотрящий напрямую в маппированный участок разделяемой памяти Wayland (`wl_shm`).
+/// Fast drawing surface (`Canvas`) pointing straight into a mapped Wayland shared memory region (`wl_shm`).
 pub struct Canvas<'a> {
     pub width: u32,
     pub height: u32,
@@ -193,7 +193,7 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Главный типаж для CPU/гибридных обоев на Rust.
+/// Main trait for CPU/hybrid Rust wallpapers.
 pub trait Wallpaper: Sized + 'static {
     fn init(args: &[String]) -> Self;
 
@@ -207,7 +207,7 @@ pub trait Wallpaper: Sized + 'static {
     fn render(&mut self, ctx: &FrameContext, canvas: &mut Canvas<'_>) -> bool;
 }
 
-/// RAII-обертка над `rustix::mm::mmap`, гарантирующая автоматический `munmap` при выходе.
+/// RAII wrapper around `rustix::mm::mmap` guaranteeing an automatic `munmap` on drop.
 struct MappedShmRegion {
     ptr: NonNull<u8>,
     size: usize,
@@ -227,7 +227,7 @@ impl MappedShmRegion {
             )?
         };
         let ptr = NonNull::new(raw_ptr.cast::<u8>())
-            .ok_or_else(|| anyhow::anyhow!("mmap вернул нулевой указатель"))?;
+            .ok_or_else(|| anyhow::anyhow!("mmap returned a null pointer"))?;
         Ok(Self { ptr, size })
     }
 
@@ -245,7 +245,7 @@ impl Drop for MappedShmRegion {
     }
 }
 
-/// Запускает цикл жизни Rust-обоев.
+/// Runs the Rust wallpaper lifecycle loop.
 pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut wallpaper = W::init(&args);
@@ -254,7 +254,7 @@ pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
         Ok(val) => val,
         Err(_) => {
             eprintln!(
-                "[rwallpprs-sdk] Автономная проверка (mode = {:?}). Для установки на стол Niri: rwallpprs set-bin <ПУТЬ_К_БИНАРНИКУ>",
+                "[rwallpprs-sdk] Standalone check (mode = {:?}). To install on the Niri desktop: rwallpprs set-bin <PATH_TO_BINARY>",
                 wallpaper.default_mode()
             );
             let width = 1920u32;
@@ -271,7 +271,7 @@ pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
             };
             let rendered = wallpaper.render(&ctx, &mut canvas);
             eprintln!(
-                "[rwallpprs-sdk] Кадр {}x{} успешно отрендерен (rendered={}).",
+                "[rwallpprs-sdk] Frame {}x{} rendered successfully (rendered={}).",
                 width, height, rendered
             );
             return Ok(());
@@ -342,7 +342,7 @@ pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Макрос для запуска CPU/гибридных обоев, реализующих [`Wallpaper`].
+/// Macro that runs a CPU/hybrid wallpaper implementing [`Wallpaper`].
 #[macro_export]
 macro_rules! run_wallpaper {
     ($wallpaper_type:ty) => {
@@ -352,7 +352,7 @@ macro_rules! run_wallpaper {
     };
 }
 
-/// Макрос для запуска аппаратных WGPU/WGSL шейдерных обоев, реализующих [`GpuShaderWallpaper`].
+/// Macro that runs a hardware WGPU/WGSL shader wallpaper implementing [`GpuShaderWallpaper`].
 #[macro_export]
 macro_rules! run_shader_wallpaper {
     ($shader_wallpaper_type:ty) => {
@@ -362,10 +362,10 @@ macro_rules! run_shader_wallpaper {
     };
 }
 
-/// Макрос для запуска сценовых WGPU-обоев, реализующих [`GpuSceneWallpaper`].
+/// Macro that runs a scene WGPU wallpaper implementing [`GpuSceneWallpaper`].
 ///
-/// Даёт обоям полноценный `wgpu::Device` / `Queue` / `CommandEncoder` для собственных
-/// пайплайнов, буферов и инстансинга, с автоматическим readback'ом готового кадра в [`Canvas`].
+/// Gives the wallpaper full `wgpu::Device` / `Queue` / `CommandEncoder` access for its own
+/// pipelines, buffers and instancing, and reads the finished frame back into a [`Canvas`] automatically.
 #[macro_export]
 macro_rules! run_scene_wallpaper {
     ($scene_wallpaper_type:ty) => {

@@ -75,9 +75,9 @@ impl DaemonConfig {
         if let Some(p) = path {
             if p.exists() {
                 let raw = std::fs::read_to_string(p)
-                    .with_context(|| format!("Не удалось прочитать конфиг {:?}", p))?;
+                    .with_context(|| format!("Failed to read config {:?}", p))?;
                 let cfg: Self = toml::from_str(&raw)
-                    .with_context(|| format!("Ошибка парсинга TOML в {:?}", p))?;
+                    .with_context(|| format!("TOML parse error in {:?}", p))?;
                 return Ok(cfg);
             }
         }

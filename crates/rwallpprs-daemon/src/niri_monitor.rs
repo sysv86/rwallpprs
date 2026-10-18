@@ -1,11 +1,11 @@
-//! Нативная интеграция с композитором **Niri** через официальный крейт [`niri_ipc`].
+//! Native integration with the **Niri** compositor through the official [`niri_ipc`] crate.
 //!
-//! Никакого ручного склеивания JSON-строк и никаких захардкоженных разрешений `1900x1060`:
-//! - Подключается через `niri_ipc::socket::Socket::connect()`.
-//! - Отправляет типизированный `niri_ipc::Request::EventStream`.
-//! - Поддерживает полный кеш состояния воркспейсов (`HashMap<u64, Workspace>`) и окон (`HashMap<u64, Window>`).
-//! - Рассчитывает долю перекрытия монитора (`focused_window_width_ratio`) относительно реальной ширины
-//!   монитора, полученной от Wayland `zwlr_layer_surface_v1::configure`.
+//! No hand-rolled JSON string concatenation and no hardcoded `1900x1060` resolutions:
+//! - Connects via `niri_ipc::socket::Socket::connect()`.
+//! - Sends the typed `niri_ipc::Request::EventStream`.
+//! - Keeps a full cache of workspace state (`HashMap<u64, Workspace>`) and window state (`HashMap<u64, Window>`).
+//! - Computes the monitor coverage fraction (`focused_window_width_ratio`) against the real monitor
+//!   width reported by Wayland `zwlr_layer_surface_v1::configure`.
 
 use niri_ipc::{socket::Socket, Event, Reply, Request, Window, Workspace};
 use rwallpprs_ipc::NiriViewportState;
@@ -42,7 +42,7 @@ impl NiriMonitor {
             .spawn(move || {
                 Self::event_loop(state_cl, conn_cl, w_cl, h_cl);
             })
-            .expect("Не удалось запустить поток niri-ipc");
+            .expect("Failed to start the niri-ipc thread");
 
         Self {
             state,
@@ -52,7 +52,7 @@ impl NiriMonitor {
         }
     }
 
-    /// Обновляет реальные логические габариты монитора при событии `LayerSurfaceConfigure`.
+    /// Updates the real logical monitor dimensions on a `LayerSurfaceConfigure` event.
     pub fn set_output_dimensions(&self, width: u32, height: u32) {
         self.output_width.store(width.max(1), Ordering::Relaxed);
         self.output_height.store(height.max(1), Ordering::Relaxed);
@@ -79,7 +79,7 @@ impl NiriMonitor {
             let mut socket = match Socket::connect() {
                 Ok(s) => s,
                 Err(e) => {
-                    debug!("Ожидание сокета Niri ($NIRI_SOCKET): {}", e);
+                    debug!("Waiting for the Niri socket ($NIRI_SOCKET): {}", e);
                     connected.store(false, Ordering::Relaxed);
                     thread::sleep(Duration::from_secs(2));
                     continue;
@@ -88,17 +88,17 @@ impl NiriMonitor {
 
             match socket.send(Request::EventStream) {
                 Ok(Reply::Ok(_)) => {
-                    info!("Успешная подписка на niri_ipc::Request::EventStream");
+                    info!("Subscribed to niri_ipc::Request::EventStream");
                     connected.store(true, Ordering::Relaxed);
                 }
                 Ok(Reply::Err(err)) => {
-                    warn!("Niri отклонил запрос EventStream: {}", err);
+                    warn!("Niri rejected the EventStream request: {}", err);
                     connected.store(false, Ordering::Relaxed);
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 }
                 Err(e) => {
-                    warn!("Ошибка отправки EventStream в сокет Niri: {}", e);
+                    warn!("Failed to send EventStream to the Niri socket: {}", e);
                     connected.store(false, Ordering::Relaxed);
                     thread::sleep(Duration::from_secs(2));
                     continue;
@@ -117,7 +117,7 @@ impl NiriMonitor {
                 );
             }
 
-            warn!("Поток событий Niri прерван, переподключение...");
+            warn!("Niri event stream interrupted, reconnecting...");
             connected.store(false, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(1));
         }
@@ -187,7 +187,7 @@ impl NiriMonitor {
             _ => {}
         }
 
-        // Пересчитываем агрегированное состояние вьюпорта Niri
+        // Recompute the aggregated Niri viewport state
         let mut guard = state.lock().unwrap();
 
         if let Some(active_ws) = workspaces
@@ -204,10 +204,10 @@ impl NiriMonitor {
         let mut has_fullscreen = false;
         let mut focused_width_ratio = 0.0f32;
 
-        // Покрытие экрана считаем по колонкам ленты Niri: ширина колонки —
-        // это максимальная ширина окна в ней (стопки окон делят одну колонку).
-        // Сумма ширин колонок, отнесённая к ширине монитора, корректно описывает
-        // и одно окно на весь экран, и 2-3 окна, вместе занимающие весь экран.
+        // Screen coverage is measured over Niri strip columns: a column is as wide
+        // as the widest window in it (windows stacked in the same column share it).
+        // Summing column widths and dividing by monitor width describes both a single
+        // fullscreen window and two or three windows that together fill the screen.
         let mut column_widths: HashMap<usize, f32> = HashMap::new();
         let mut no_layout_width = 0.0f32;
 
@@ -217,13 +217,13 @@ impl NiriMonitor {
                 let tile_w = win.layout.tile_size.0 as f32;
                 let tile_h = win.layout.tile_size.1 as f32;
 
-                // Проверяем, занимает ли окно 100% физического/логического экрана (Fullscreen в Niri)
+                // Check whether the window fills 100% of the physical/logical screen (Niri fullscreen)
                 if tile_w >= (out_w as f32 * 0.995) && tile_h >= (out_h as f32 * 0.995) {
                     has_fullscreen = true;
                 }
 
-                // Плавающие окна не тайлятся в колонки — учитываем их отдельно,
-                // чтобы они не «склеивались» в одну колонку с тайлом по row-индексу.
+                // Floating windows are not tiled into columns. Account for them separately
+                // so they do not get merged into a column by row index.
                 if win.is_floating {
                     no_layout_width = no_layout_width.max(tile_w.min(out_w as f32));
                 } else if let Some((col_idx, _row_idx)) = win.layout.pos_in_scrolling_layout {
@@ -242,8 +242,8 @@ impl NiriMonitor {
             }
         }
 
-        // Колонки ленты идут вплотную: если сумма их ширин покрывает монитор,
-        // обои не видны ни при каком горизонтальном скролле.
+        // Strip columns sit flush against each other: once their widths cover the
+        // monitor, the wallpaper is invisible at any horizontal scroll offset.
         let cols_total: f32 = column_widths.values().copied().sum::<f32>() + no_layout_width;
         let screen_coverage_ratio = (cols_total / (out_w.max(1) as f32)).clamp(0.0, 1.0);
 
