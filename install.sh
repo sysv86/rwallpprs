@@ -46,6 +46,22 @@ usage() {
     sed -n '3,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
 }
 
+# ---------------------------------------------------------------------------
+# When the script is piped into bash, stdin is the script itself. Any command
+# that reads from stdin (sudo's password prompt) would swallow the remaining
+# script text, so re-exec from a real file first — before parsing arguments,
+# so that "$@" reaches the re-executed copy intact.
+# ---------------------------------------------------------------------------
+if [[ ! -t 0 && -z "${RWALLPPRS_INSTALL_REEXEC:-}" ]]; then
+    export RWALLPPRS_INSTALL_REEXEC=1
+    tmp="$(mktemp /tmp/rwallpprs-install.XXXXXX.sh)"
+    curl -fsSL "$SELF_URL" -o "$tmp" || die "could not download $SELF_URL"
+    if { : </dev/tty; } 2>/dev/null; then
+        exec bash "$tmp" "$@" </dev/tty
+    fi
+    exec bash "$tmp" "$@"
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)     [[ -n "${2:-}" ]] || die "--prefix needs a directory"; PREFIX="$2"; shift 2 ;;
@@ -57,21 +73,6 @@ while [[ $# -gt 0 ]]; do
         *)            die "unknown option: $1 (try --help)" ;;
     esac
 done
-
-# ---------------------------------------------------------------------------
-# When the script is piped into bash, stdin is the script itself. Any command
-# that reads from stdin (sudo's password prompt) would swallow the remaining
-# script text, so re-exec from a real file first.
-# ---------------------------------------------------------------------------
-if [[ ! -t 0 && -z "${RWALLPPRS_INSTALL_REEXEC:-}" ]]; then
-    export RWALLPPRS_INSTALL_REEXEC=1
-    tmp="$(mktemp /tmp/rwallpprs-install.XXXXXX.sh)"
-    curl -fsSL "$SELF_URL" -o "$tmp" || die "could not download $SELF_URL"
-    if { : </dev/tty; } 2>/dev/null; then
-        exec bash "$tmp" "$@" </dev/tty
-    fi
-    exec bash "$tmp" "$@"
-fi
 
 [[ "$(uname -s)" == "Linux" ]] || die "RWallpprs targets Linux (Niri runs on Linux only)"
 
