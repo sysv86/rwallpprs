@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use config::DaemonConfig;
 use niri_monitor::NiriMonitor;
-use power_manager::PowerManager;
+use power_manager::{power_state_hint, PowerManager};
 use rust_runner::RustWallpaperRunner;
 use rwallpprs_ipc::{
     read_framed_msg, write_framed_msg, ControlCommand, ControlResponse, DaemonStatusReport,
@@ -89,6 +89,14 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         )
         .init();
 
+    // A panic that unwinds out of the main loop kills the whole session and leaves a
+    // stale socket behind, which looks exactly like "the wallpaper stopped working".
+    // Log it with a backtrace so the cause is recoverable from the logs.
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        error!("PANIC in rwallpprs-daemon: {info}\n{backtrace}");
+    }));
+
     let cfg = DaemonConfig::load_or_default(config_path.as_deref())?;
     info!("Starting RWallpprs v0.2.0-beta.1 daemon under the Niri compositor...");
 
@@ -133,6 +141,8 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let mut video_direct_backoff: u32 = 0;
     let mut video_slot: u8 = 0;
     let mut running = true;
+    // Last suppression reason, so a state change is logged once instead of every tick
+    let mut last_power_reason: Option<String> = None;
 
     while running {
         let frame_start = Instant::now();
@@ -204,6 +214,7 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         };
 
         let power_state = power_mgr.evaluate(&niri_state, current_mode, first_frame_rendered);
+        log_power_transition(&mut last_power_reason, &power_state);
 
         match power_state {
             PowerRuntimeState::HiddenOccluded { .. } => {
@@ -511,8 +522,14 @@ fn handle_cli_client(
                 *first_frame_rendered = false;
                 ControlResponse::Ok {
                     message: format!(
-                        "Started native ffmpeg-next decoder for {:?} (codec {:?}, hw={:?}, {}x{}@{}fps)",
-                        path, codec, hw_accel, width, height, fps_limit
+                        "Started native ffmpeg-next decoder for {:?} (codec {:?}, hw={:?}, {}x{}@{}fps){}",
+                        path,
+                        codec,
+                        hw_accel,
+                        width,
+                        height,
+                        fps_limit,
+                        power_note(power_mgr, niri_monitor, RustWallpaperMode::Animated, *first_frame_rendered)
                     ),
                 }
             }
@@ -540,8 +557,14 @@ fn handle_cli_client(
                 *first_frame_rendered = false;
                 ControlResponse::Ok {
                     message: format!(
-                        "Started native Rust wallpaper {:?} (PID={}, mode={:?}, {}x{}@{}fps)",
-                        bin_path, pid, mode, width, height, fps
+                        "Started native Rust wallpaper {:?} (PID={}, mode={:?}, {}x{}@{}fps){}",
+                        bin_path,
+                        pid,
+                        mode,
+                        width,
+                        height,
+                        fps,
+                        power_note(power_mgr, niri_monitor, mode, *first_frame_rendered)
                     ),
                 }
             }
@@ -571,11 +594,12 @@ fn handle_cli_client(
                 *first_frame_rendered = false;
                 ControlResponse::Ok {
                     message: format!(
-                        "Embedded binary '{}' ({} KB) loaded into a persistent daemon memfd and started (PID={}, mode={:?})",
+                        "Embedded binary '{}' ({} KB) loaded into a persistent daemon memfd and started (PID={}, mode={:?}){}",
                         name,
                         elf_payload.len() / 1024,
                         pid,
-                        mode
+                        mode,
+                        power_note(power_mgr, niri_monitor, mode, *first_frame_rendered)
                     ),
                 }
             }
@@ -638,6 +662,42 @@ fn handle_cli_client(
 
     write_framed_msg(&mut stream, &resp)?;
     Ok(())
+}
+
+/// Logs each transition between rendering and suppressed, so a paused wallpaper is
+/// never mistaken for a crashed one.
+fn log_power_transition(last_reason: &mut Option<String>, state: &PowerRuntimeState) {
+    let signature = match state {
+        PowerRuntimeState::ActiveRendering => None,
+        PowerRuntimeState::UserPaused => Some("user_paused".to_string()),
+        PowerRuntimeState::FrozenStatic { reason }
+        | PowerRuntimeState::HiddenOccluded { reason } => Some(reason.clone()),
+    };
+    if *last_reason == signature {
+        return;
+    }
+    match power_state_hint(state) {
+        Some(hint) => warn!("Wallpaper paused: {hint}"),
+        None => info!("Wallpaper resumed and is rendering"),
+    }
+    *last_reason = signature;
+}
+
+/// Suffix for a start-up reply explaining that the wallpaper begins in a suppressed state.
+fn power_note(
+    power_mgr: &mut PowerManager,
+    niri_monitor: &NiriMonitor,
+    mode: RustWallpaperMode,
+    first_frame_rendered: bool,
+) -> String {
+    match power_state_hint(&power_mgr.evaluate(
+        &niri_monitor.snapshot(),
+        mode,
+        first_frame_rendered,
+    )) {
+        Some(hint) => format!(" [paused: {hint}]"),
+        None => String::new(),
+    }
 }
 
 fn main() -> anyhow::Result<()> {

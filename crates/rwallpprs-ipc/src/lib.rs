@@ -66,6 +66,13 @@ pub struct PowerSavePolicy {
     pub maximized_column_threshold: f32,
     pub wake_on_niri_overview: bool,
     pub battery_freeze_threshold: u8,
+    /// How often `/sys/class/power_supply` is re-read while evaluating the battery rule.
+    #[serde(default = "default_battery_poll_interval_sec")]
+    pub battery_poll_interval_sec: u32,
+}
+
+pub fn default_battery_poll_interval_sec() -> u32 {
+    15
 }
 
 impl Default for PowerSavePolicy {
@@ -78,6 +85,7 @@ impl Default for PowerSavePolicy {
             maximized_column_threshold: 0.96,
             wake_on_niri_overview: true,
             battery_freeze_threshold: 25,
+            battery_poll_interval_sec: default_battery_poll_interval_sec(),
         }
     }
 }

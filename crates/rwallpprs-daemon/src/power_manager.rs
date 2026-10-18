@@ -5,6 +5,10 @@
 //! 2. Fullscreen state (`has_fullscreen_window`).
 //! 3. Whether Niri Overview is open (`overview_open`).
 //! 4. Battery charge level from `/sys/class/power_supply/BAT*`.
+//!
+//! [`power_state_hint`] turns a suppressed state into a one-line explanation for the
+//! user, because "the wallpaper stopped moving" is otherwise indistinguishable from a
+//! crash: the paused engine leaves its last frame on screen.
 
 use rwallpprs_ipc::{
     NiriViewportState, PowerRuntimeState, PowerSavePolicy, RustWallpaperMode,
@@ -74,7 +78,7 @@ impl PowerManager {
             };
         }
 
-        if self.last_battery_check.elapsed() >= Duration::from_secs(15) {
+        if self.last_battery_check.elapsed() >= Duration::from_secs(self.policy.battery_poll_interval_sec.max(1) as u64) {
             self.refresh_battery_sysfs();
         }
         if self.cached_on_battery
@@ -116,4 +120,39 @@ impl PowerManager {
             }
         }
     }
+}
+
+/// One-line explanation of a suppressed render state, for logs and CLI replies.
+///
+/// Returns `None` when the wallpaper is actually rendering.
+pub fn power_state_hint(state: &PowerRuntimeState) -> Option<String> {
+    let hint = match state {
+        PowerRuntimeState::ActiveRendering => return None,
+        PowerRuntimeState::UserPaused => {
+            "paused by request; resume with `rwallpprs power --toggle-pause`".to_string()
+        }
+        PowerRuntimeState::FrozenStatic { reason }
+        | PowerRuntimeState::HiddenOccluded { reason } => match reason.as_str() {
+            "static_wallpaper_mode" => "static wallpaper mode renders a single frame; \
+                 start it with `--mode animated` to keep it moving"
+                .to_string(),
+            "battery_below_threshold" => {
+                "on battery below the configured limit; raise it with \
+                 `rwallpprs power --battery-limit 0` (or disable power saving with \
+                 `rwallpprs power --enabled off`)"
+                    .to_string()
+            }
+            "niri_fullscreen_window" => {
+                "a fullscreen window is open; disable with `rwallpprs power --pause-fullscreen off`"
+                    .to_string()
+            }
+            "niri_screen_fully_covered" => {
+                "the tiled windows cover the screen; disable with \
+                 `rwallpprs power --pause-maximized off`"
+                    .to_string()
+            }
+            other => format!("suppressed by the power saving policy ({other})"),
+        },
+    };
+    Some(hint)
 }
