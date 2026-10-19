@@ -1,7 +1,9 @@
 //! Integration with the Wayland `zwlr_layer_shell_v1` protocol for the **Niri** compositor.
 
 use anyhow::Context as _;
-use rwallpprs_ipc::ShmBufferHeader;
+use rustix::fs::fstat;
+use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
+use rwallpprs_ipc::{OutputStatus, ShmBufferHeader};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -18,50 +20,35 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use std::{os::fd::BorrowedFd, os::fd::RawFd, ptr::NonNull};
-use rustix::fs::fstat;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_buffer, wl_output, wl_shm, wl_shm_pool, wl_surface},
     Connection, Dispatch, QueueHandle,
 };
-use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 
-/// Zero-copy direct present: the `wl_shm` pool is created over the same `memfd`
-/// the engine renders into (a Rust binary over the SHM protocol, video through the
-/// daemon's own memfd ring). Frames reach the compositor with **not a single
-/// memcpy**; the main loop falls back to the copying `present_frame` when direct
-/// mode is unavailable.
+/// Zero-copy direct presenter: imports the engine's `memfd` into a `wl_shm_pool`
+/// so frames reach the Wayland compositor without any intermediate `memcpy`.
 pub struct DirectShmPresent {
-    /// Kept alive while buffers from it are still active on the surface
+    /// Kept alive while buffers from it remain attached to the surface.
     #[allow(dead_code)]
     pool: wl_shm_pool::WlShmPool,
-    /// `(wl_buffer, released)`: `true` means the server returned the buffer and the slot can be filled
+    /// `(wl_buffer, released)`: `true` means the compositor released the slot for reuse.
     buffers: Vec<(wl_buffer::WlBuffer, bool)>,
     width: u32,
     height: u32,
-    /// fd and dimensions of the source memfd the pool was created over. Needed for the
-    /// consistency check in the daemon main loop: after an engine switch (SetVideo /
-    /// SetRustBin / SetEmbeddedBin) a stale presenter would otherwise keep showing the
-    /// compositor buffers from someone else's memfd.
+    /// Raw descriptor and dimensions of the backing `memfd`.
     source_fd: RawFd,
-    /// File identity of the source (dev/ino from fstat): the kernel reuses fd numbers
-    /// after close, so a fd number alone cannot tell an old memfd from a new one.
+    /// Kernel file identity (`st_dev`, `st_ino`) used to detect descriptor reuse across engine switches.
     source_dev: u64,
     source_ino: u64,
-    /// Second daemon mmap of the same memfd (pointing exactly at the engine slots).
-    /// Used to write frames (video) straight into compositor memory without copies.
+    /// Daemon mapping of the `memfd` used when decoding video frames directly into SHM slots.
     shm_ptr: NonNull<u8>,
     slot_size_bytes: usize,
 }
 
 impl DirectShmPresent {
-    /// Imports the engine memfd (`direct_fd`) as a `wl_shm` pool and creates one
-    /// `wl_buffer` per `ShmBufferHeader` slot offset (0 and 1), stride `width*4`,
-    /// format `XRGB8888`. `udata=slot` ties release events to slots.
-    ///
-    /// `write_header=true` is for the daemon video memfd ring: the header only
-    /// appears here. For a Rust runner memfd pass `false`: `spawn_internal`
-    /// already wrote the header.
+    /// Imports `direct_fd` as a `wl_shm_pool` and creates two `wl_buffer` objects for slots 0 and 1
+    /// (`XRGB8888`, stride `width * 4`).
     pub fn init(
         shm: &wl_shm::WlShm,
         qh: &QueueHandle<WaylandLayerContext>,
@@ -75,8 +62,6 @@ impl DirectShmPresent {
 
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(direct_fd) };
 
-        // mmap first: on failure there is no wl_shm_pool or wl_buffer yet, so
-        // there is nothing to clean up and the error path stays transparent
         let raw_ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -91,22 +76,23 @@ impl DirectShmPresent {
         let shm_ptr = match NonNull::new(raw_ptr.cast::<u8>()) {
             Some(p) => p,
             None => {
-                unsafe { let _ = munmap(raw_ptr.cast(), total_size); }
+                unsafe {
+                    let _ = munmap(raw_ptr.cast(), total_size);
+                }
                 anyhow::bail!("mmap returned a null pointer");
             }
         };
 
-        // File identity of the source: the main loop needs dev/ino to tell this
-        // memfd apart from a new one reusing the same fd number
         let stat = match fstat(borrowed_fd) {
             Ok(stat) => stat,
             Err(e) => {
-                unsafe { let _ = munmap(shm_ptr.as_ptr().cast(), total_size); }
+                unsafe {
+                    let _ = munmap(shm_ptr.as_ptr().cast(), total_size);
+                }
                 return Err(e).context("rustix::fs::fstat failed on the direct present source");
             }
         };
 
-        // The daemon maps the same memfd so it can write frames straight into the slots
         let pool = shm.create_pool(borrowed_fd, total_size as i32, qh, ());
 
         let buffers = (0..2usize)
@@ -120,15 +106,14 @@ impl DirectShmPresent {
                     qh,
                     i,
                 );
-                // The server has shown nothing yet, so both slots count as free
                 (buffer, true)
             })
             .collect::<Vec<_>>();
 
-        // The header is rewritten only where it does not exist yet: for the daemon
-        // video memfd it appears right here; the Rust runner memfd is already laid out.
         if write_header {
-            unsafe { std::ptr::write(shm_ptr.as_ptr().cast::<ShmBufferHeader>(), header) };
+            unsafe {
+                std::ptr::write(shm_ptr.as_ptr().cast::<ShmBufferHeader>(), header);
+            }
         }
 
         Ok(Self {
@@ -144,8 +129,7 @@ impl DirectShmPresent {
         })
     }
 
-    /// Direct `&mut` slice of a memfd slot (0/1) for the engine to write a frame into — zero copies.
-    /// `None` if the slot is still held by the compositor (it must not be overwritten).
+    /// Returns a mutable slice to slot `0` or `1` if the compositor has released that buffer.
     unsafe fn slot_slice_mut(&mut self, slot: usize) -> Option<&mut [u8]> {
         let slot = slot & 1;
         if !self.buffers[slot].1 {
@@ -161,16 +145,11 @@ impl DirectShmPresent {
 
 impl Drop for DirectShmPresent {
     fn drop(&mut self) {
-        // Explicitly send wl_buffer.destroy for both buffers and wl_shm_pool.destroy
-        // so the compositor drops its reference to the memfd memory; with the
-        // wayland-client 0.31 typed proxies destroy is a generated request.
         for (buffer, _) in &self.buffers {
             buffer.destroy();
         }
         self.pool.destroy();
 
-        // Release the daemon mmap: the compositor holds its own mapping through its
-        // own fd, so only this process's virtual memory is dropped here.
         let total_size = ShmBufferHeader::HEADER_SIZE + self.slot_size_bytes * 2;
         unsafe {
             let _ = munmap(self.shm_ptr.as_ptr().cast(), total_size);
@@ -178,8 +157,6 @@ impl Drop for DirectShmPresent {
     }
 }
 
-/// File identity check: compares dev/ino via fstat. fd numbers are reused after
-/// close, so the number alone guarantees nothing.
 fn file_identity_matches(fd: RawFd, source_dev: u64, source_ino: u64) -> bool {
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     match fstat(borrowed) {
@@ -195,7 +172,6 @@ pub struct WaylandLayerContext {
     pub shm_state: Shm,
     pub layer_shell: LayerShell,
     pub pool: Option<SlotPool>,
-    /// Zero-copy direct presenter over the engine memfd; `None` means the copying `present_frame` path
     pub direct: Option<DirectShmPresent>,
     pub layer_surface: Option<LayerSurface>,
     pub width: u32,
@@ -252,6 +228,72 @@ impl WaylandLayerContext {
         Ok((conn, event_queue, ctx))
     }
 
+    /// Queries the dimensions of the first active Wayland output mode, if reported by the compositor.
+    fn primary_output_dimensions(&self) -> Option<(u32, u32)> {
+        for output in self.output_state.outputs() {
+            if let Some(info) = self.output_state.info(&output) {
+                if let Some(mode) = info
+                    .modes
+                    .iter()
+                    .find(|m| m.current)
+                    .or_else(|| info.modes.first())
+                {
+                    let (w, h) = mode.dimensions;
+                    if w > 0 && h > 0 {
+                        return Some((w as u32, h as u32));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns telemetry for all connected Wayland outputs (falling back to a synthetic entry
+    /// if the compositor has not advertised `wl_output` details yet).
+    pub fn query_outputs(&self, surface_visible: bool, current_fps: f32) -> Vec<OutputStatus> {
+        let mut list = Vec::new();
+        for output in self.output_state.outputs() {
+            if let Some(info) = self.output_state.info(&output) {
+                let name = info
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Niri-Primary-Output".to_string());
+                let (w, h, refresh_mhz) = info
+                    .modes
+                    .iter()
+                    .find(|m| m.current)
+                    .or_else(|| info.modes.first())
+                    .map(|m| {
+                        (
+                            (m.dimensions.0.max(0) as u32).max(self.width),
+                            (m.dimensions.1.max(0) as u32).max(self.height),
+                            m.refresh_rate.max(0) as u32,
+                        )
+                    })
+                    .unwrap_or((self.width, self.height, 60_000));
+                list.push(OutputStatus {
+                    name,
+                    width: self.width.max(w.min(self.width)),
+                    height: self.height.max(h.min(self.height)),
+                    refresh_mhz,
+                    surface_visible,
+                    current_fps,
+                });
+            }
+        }
+        if list.is_empty() {
+            list.push(OutputStatus {
+                name: "Niri-Primary-Output".into(),
+                width: self.width,
+                height: self.height,
+                refresh_mhz: 60_000,
+                surface_visible,
+                current_fps,
+            });
+        }
+        list
+    }
+
     pub fn present_frame(&mut self, pixels_bgra: &[u8]) -> anyhow::Result<()> {
         if !self.configured {
             anyhow::bail!("present_frame: surface is not configured by the compositor yet");
@@ -295,12 +337,6 @@ impl WaylandLayerContext {
         Ok(())
     }
 
-    /// Brings up zero-copy direct present: the `direct_fd` memfd is imported into `wl_shm`
-    /// as a pool, and the compositor displays exactly the daemon memory the engine renders into.
-    /// Return `Err` tells the main loop to fall back to the copying `present_frame`.
-    ///
-    /// `write_header=true` is only for the daemon video ring (the header appears
-    /// here); for a Rust runner memfd pass `false` (the header is already written).
     pub fn init_direct_shm(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -317,20 +353,21 @@ impl WaylandLayerContext {
         }
         let shm = self.shm_state.wl_shm().clone();
         self.direct = Some(DirectShmPresent::init(
-            &shm, qh, direct_fd, width, height, write_header,
+            &shm,
+            qh,
+            direct_fd,
+            width,
+            height,
+            write_header,
         )?);
         Ok(())
     }
 
-    /// Keeps the direct presenter consistent with the current engine: if the
-    /// presenter points at a foreign or unavailable source (`None`) or its fd no
-    /// longer matches the current one (`Some`), it is dropped. Called with the fd of
-    /// the current `VideoDirectRing` for video, and with `runner.shm_raw_fd()` for a
-    /// Rust binary.
     pub fn reset_direct_if_stale(&mut self, source: Option<(RawFd, u32, u32)>) {
         let stale = match (&self.direct, source) {
             (Some(d), Some((fd, w, h))) => {
-                (d.source_fd, d.width, d.height) != (fd, w, h) || !file_identity_matches(fd, d.source_dev, d.source_ino)
+                (d.source_fd, d.width, d.height) != (fd, w, h)
+                    || !file_identity_matches(fd, d.source_dev, d.source_ino)
             }
             (Some(_), None) => true,
             (None, _) => false,
@@ -340,9 +377,6 @@ impl WaylandLayerContext {
         }
     }
 
-    /// Whether the direct presenter slot is free for the next frame (the compositor
-    /// already sent release). `true` when direct is absent: flow control must not gate
-    /// a path where direct does not exist, since the copying fallback covers it.
     pub fn direct_slot_free(&self, slot: u8) -> bool {
         match &self.direct {
             Some(direct) => direct
@@ -353,24 +387,18 @@ impl WaylandLayerContext {
         }
     }
 
-    /// Zero-copy presentation of a slot: attach the direct `wl_buffer` over the memfd + full damage.
-    /// `Ok(true)` means the frame reached the screen; `Ok(false)` means direct is unavailable or the
-    /// slot is busy (the server has not returned the buffer yet), so the main loop falls back to `present_frame`.
     pub fn present_shm_slot(&mut self, slot: usize) -> anyhow::Result<bool> {
         if !self.configured {
             anyhow::bail!("present_shm_slot: surface is not configured by the compositor");
         }
         let slot = slot & 1;
 
-        // Split field borrows: layer_surface (immutable) and direct (mutable)
         match (&self.layer_surface, self.direct.as_mut()) {
             (Some(layer_surface), Some(direct)) => {
                 if !direct.buffers[slot].1 {
-                    // Slot still held by the compositor (no release yet) — use the copying path
                     return Ok(false);
                 }
                 let wl_surf = layer_surface.wl_surface();
-                // Attach the memfd memory directly so pixels reach the compositor with no copies
                 wl_surf.attach(Some(&direct.buffers[slot].0), 0, 0);
                 wl_surf.damage_buffer(0, 0, direct.width as i32, direct.height as i32);
                 wl_surf.commit();
@@ -382,16 +410,11 @@ impl WaylandLayerContext {
         Ok(true)
     }
 
-    /// Hands out a `&mut` slice of a memfd slot (0/1) for the engine to write a frame
-    /// into directly (e.g. `video.decode_next_frame_into`). `None` means the copying path.
     pub fn direct_slot_slice(&mut self, slot: usize) -> Option<&mut [u8]> {
         let direct = self.direct.as_mut()?;
         unsafe { direct.slot_slice_mut(slot) }
     }
 
-    /// Marks the wallpaper as hidden from drawing without detaching the surface buffer:
-    /// actually detaching a wl_buffer from a layer surface makes Niri raise a protocol
-    /// error and kills the layer (see the call site in main.rs).
     pub fn mark_hidden_for_powersave(&mut self) {
         self.surface_hidden = true;
     }
@@ -485,14 +508,20 @@ impl LayerShellHandler for WaylandLayerContext {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let new_w = configure.new_size.0.max(640);
-        let new_h = configure.new_size.1.max(360);
+        // Per zwlr_layer_shell_v1 protocol, (0, 0) means the compositor lets the client choose
+        // its surface dimensions; use the active wl_output mode or preserve current dimensions.
+        let (new_w, new_h) = if configure.new_size.0 > 0 && configure.new_size.1 > 0 {
+            (configure.new_size.0.max(64), configure.new_size.1.max(64))
+        } else if let Some((ow, oh)) = self.primary_output_dimensions() {
+            (ow, oh)
+        } else {
+            (self.width, self.height)
+        };
+
         if new_w != self.width || new_h != self.height {
             self.width = new_w;
             self.height = new_h;
             self.pool = None;
-            // The direct presenter targets the previous memfd layout, so fall back to
-            // copying; it will be lazily recreated on the engine's next frame
             self.direct = None;
             self.resolution_changed = true;
         }
@@ -507,12 +536,6 @@ impl ShmHandler for WaylandLayerContext {
 }
 
 impl Dispatch<wl_buffer::WlBuffer, usize> for WaylandLayerContext {
-    /// `wl_buffer.release`: the server finished reading the buffer, so the slot is ready again.
-    /// Event ordering is guaranteed by the roundtrip in the daemon main loop.
-    ///
-    /// The slot is unfrozen only when the release came from a buffer currently listed in
-    /// `direct` (compared by ObjectId): a release from a previous presenter must not open
-    /// slots of the new one.
     fn event(
         state: &mut Self,
         _proxy: &wl_buffer::WlBuffer,
@@ -523,10 +546,12 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for WaylandLayerContext {
     ) {
         if let wl_buffer::Event::Release = event {
             if let Some(direct) = state.direct.as_mut() {
-                match direct.buffers.iter_mut().find(|(buffer, _)| *buffer == *_proxy) {
-                    Some((_, released)) => *released = true,
-                    // Foreign (already replaced) buffer: ignore, those slots are not ours
-                    None => {}
+                if let Some((_, released)) = direct
+                    .buffers
+                    .iter_mut()
+                    .find(|(buffer, _)| *buffer == *_proxy)
+                {
+                    *released = true;
                 }
             }
         }
@@ -534,7 +559,6 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for WaylandLayerContext {
 }
 
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandLayerContext {
-    /// `wl_shm_pool` has no events: this stub only satisfies the Dispatch trait
     fn event(
         _state: &mut Self,
         _proxy: &wl_shm_pool::WlShmPool,

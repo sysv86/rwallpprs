@@ -1,11 +1,10 @@
 //! Native integration with the **Niri** compositor through the official [`niri_ipc`] crate.
 //!
-//! No hand-rolled JSON string concatenation and no hardcoded `1900x1060` resolutions:
 //! - Connects via `niri_ipc::socket::Socket::connect()`.
-//! - Sends the typed `niri_ipc::Request::EventStream`.
-//! - Keeps a full cache of workspace state (`HashMap<u64, Workspace>`) and window state (`HashMap<u64, Window>`).
-//! - Computes the monitor coverage fraction (`focused_window_width_ratio`) against the real monitor
-//!   width reported by Wayland `zwlr_layer_surface_v1::configure`.
+//! - Subscribes to `niri_ipc::Request::EventStream`.
+//! - Maintains an in-memory cache of workspaces (`HashMap<u64, Workspace>`) and windows (`HashMap<u64, Window>`).
+//! - Computes monitor coverage (`focused_window_width_ratio`, `screen_coverage_ratio`) and strip
+//!   scroll offset (`strip_scroll_offset`) against the real output dimensions reported by Wayland.
 
 use niri_ipc::{socket::Socket, Event, Reply, Request, Window, Workspace};
 use rwallpprs_ipc::NiriViewportState;
@@ -52,14 +51,17 @@ impl NiriMonitor {
         }
     }
 
-    /// Updates the real logical monitor dimensions on a `LayerSurfaceConfigure` event.
+    /// Updates the logical monitor dimensions after a Wayland `LayerSurfaceConfigure` event.
     pub fn set_output_dimensions(&self, width: u32, height: u32) {
         self.output_width.store(width.max(1), Ordering::Relaxed);
         self.output_height.store(height.max(1), Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> NiriViewportState {
-        self.state.lock().unwrap().clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -79,7 +81,7 @@ impl NiriMonitor {
             let mut socket = match Socket::connect() {
                 Ok(s) => s,
                 Err(e) => {
-                    debug!("Waiting for the Niri socket ($NIRI_SOCKET): {}", e);
+                    debug!("Waiting for Niri socket ($NIRI_SOCKET): {}", e);
                     connected.store(false, Ordering::Relaxed);
                     thread::sleep(Duration::from_secs(2));
                     continue;
@@ -180,15 +182,18 @@ impl NiriMonitor {
                 }
             }
             Event::OverviewOpenedOrClosed { is_open } => {
-                let mut guard = state.lock().unwrap();
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard.overview_open = is_open;
                 return;
             }
             _ => {}
         }
 
-        // Recompute the aggregated Niri viewport state
-        let mut guard = state.lock().unwrap();
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(active_ws) = workspaces
             .values()
@@ -203,11 +208,8 @@ impl NiriMonitor {
         let mut count_on_ws = 0u32;
         let mut has_fullscreen = false;
         let mut focused_width_ratio = 0.0f32;
+        let mut focused_col_idx: Option<usize> = None;
 
-        // Screen coverage is measured over Niri strip columns: a column is as wide
-        // as the widest window in it (windows stacked in the same column share it).
-        // Summing column widths and dividing by monitor width describes both a single
-        // fullscreen window and two or three windows that together fill the screen.
         let mut column_widths: HashMap<usize, f32> = HashMap::new();
         let mut no_layout_width = 0.0f32;
 
@@ -217,13 +219,10 @@ impl NiriMonitor {
                 let tile_w = win.layout.tile_size.0 as f32;
                 let tile_h = win.layout.tile_size.1 as f32;
 
-                // Check whether the window fills 100% of the physical/logical screen (Niri fullscreen)
                 if tile_w >= (out_w as f32 * 0.995) && tile_h >= (out_h as f32 * 0.995) {
                     has_fullscreen = true;
                 }
 
-                // Floating windows are not tiled into columns. Account for them separately
-                // so they do not get merged into a column by row index.
                 if win.is_floating {
                     no_layout_width = no_layout_width.max(tile_w.min(out_w as f32));
                 } else if let Some((col_idx, _row_idx)) = win.layout.pos_in_scrolling_layout {
@@ -236,14 +235,26 @@ impl NiriMonitor {
                 if win.is_focused {
                     focused_width_ratio = (tile_w / (out_w.max(1) as f32)).clamp(0.0, 1.0);
                     if let Some((col_idx, _row_idx)) = win.layout.pos_in_scrolling_layout {
-                        guard.strip_scroll_offset = (col_idx as f64) * 320.0;
+                        focused_col_idx = Some(col_idx);
                     }
                 }
             }
         }
 
-        // Strip columns sit flush against each other: once their widths cover the
-        // monitor, the wallpaper is invisible at any horizontal scroll offset.
+        if let Some(target_col) = focused_col_idx {
+            // Compute strip offset from accumulated column widths to the left of the focused column.
+            let preceding_px: f64 = column_widths
+                .iter()
+                .filter(|(&col, _)| col < target_col)
+                .map(|(_, &w)| (w as f64).max(320.0) * 0.35)
+                .sum();
+            guard.strip_scroll_offset = if preceding_px > 0.0 {
+                preceding_px
+            } else {
+                (target_col as f64) * 320.0
+            };
+        }
+
         let cols_total: f32 = column_widths.values().copied().sum::<f32>() + no_layout_width;
         let screen_coverage_ratio = (cols_total / (out_w.max(1) as f32)).clamp(0.0, 1.0);
 

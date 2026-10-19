@@ -1,11 +1,11 @@
 //! Supervisor for compiled Rust wallpaper binaries (`RustWallpaperRunner`).
 //!
-//! `v0.2.0-beta.1` changes:
-//! 1. Uses the safe wrappers [`rustix::fs::memfd_create`], [`rustix::fs::ftruncate`] and [`rustix::mm::mmap`].
-//! 2. Keeps the **embedded ELF image (`embedded_elf_fd: Option<OwnedFd>`)** alive inside the daemon.
-//!    When the user runs `rwallpprs run-embedded`, the daemon creates a long-lived `memfd` holding the
-//!    wallpaper ELF and executes `/proc/self/fd/<fd>`, so the CLI can exit immediately while the daemon
-//!    stays able to restart the embedded binary at any time.
+//! Responsibilities:
+//! 1. Manages POSIX shared memory (`memfd_create`, `ftruncate`, `mmap`) via safe [`rustix`] wrappers.
+//! 2. Preserves embedded ELF images (`embedded_elf_fd: Option<OwnedFd>`) inside the daemon across
+//!    the entire session so `run-embedded` wallpapers can be cleanly restarted on monitor resolution
+//!    changes (`resize_output`) or after unexpected worker crashes.
+//! 3. Provides automatic crash recovery with backoff when a worker process terminates unexpectedly.
 
 use anyhow::{Context, Result};
 use rustix::{
@@ -17,11 +17,14 @@ use rwallpprs_ipc::{
     NiriViewportState, RustWallpaperMode, ShmBufferHeader, WorkerAck, WorkerEvent,
 };
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::ptr::NonNull;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const MAX_CRASH_RESTARTS: u32 = 3;
+const CRASH_RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
 pub struct RustWallpaperRunner {
     pub display_name: String,
@@ -34,8 +37,9 @@ pub struct RustWallpaperRunner {
     shm_fd: OwnedFd,
     shm_ptr: NonNull<u8>,
     shm_size: usize,
-    /// Holds the ELF image of a wallpaper started via `run-embedded` in daemon RAM.
-    _embedded_elf_fd: Option<OwnedFd>,
+    /// Keeps the ELF image of a wallpaper started via `run-embedded` alive in daemon RAM
+    /// so `/proc/self/fd/<fd>` remains executable across resolution changes and restarts.
+    embedded_elf_fd: Option<OwnedFd>,
     child: Child,
     child_stdin: ChildStdin,
     child_stdout: BufReader<ChildStdout>,
@@ -45,12 +49,14 @@ pub struct RustWallpaperRunner {
     last_frame_instant: Instant,
     suspended: bool,
     last_niri_snapshot: Option<NiriViewportState>,
+    crash_restarts: u32,
+    last_restart_instant: Option<Instant>,
 }
 
 unsafe impl Send for RustWallpaperRunner {}
 
 impl RustWallpaperRunner {
-    /// Runs an external compiled Rust wallpaper binary from a path on disk.
+    /// Launches an external compiled Rust wallpaper binary from disk.
     pub fn spawn_from_path(
         bin_path: PathBuf,
         args: Vec<String>,
@@ -63,10 +69,19 @@ impl RustWallpaperRunner {
             anyhow::bail!("Rust wallpaper binary not found: {:?}", bin_path);
         }
         let display_name = bin_path.display().to_string();
-        Self::spawn_internal(display_name, bin_path, None, args, mode, target_fps, width, height)
+        Self::spawn_internal(
+            display_name,
+            bin_path,
+            None,
+            args,
+            mode,
+            target_fps,
+            width,
+            height,
+        )
     }
 
-    /// Runs a wallpaper ELF binary embedded in the CLI straight from daemon memory (`memfd_create`).
+    /// Launches a wallpaper ELF binary embedded in the CLI straight from daemon memory (`memfd_create`).
     pub fn spawn_from_embedded_elf(
         name: String,
         elf_payload: &[u8],
@@ -101,28 +116,30 @@ impl RustWallpaperRunner {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_internal(
-        display_name: String,
-        exec_path: PathBuf,
-        embedded_elf_fd: Option<OwnedFd>,
-        args: Vec<String>,
-        mode: RustWallpaperMode,
-        target_fps: u32,
+    fn allocate_shm_and_spawn_child(
+        display_name: &str,
+        exec_path: &Path,
+        args: &[String],
         width: u32,
         height: u32,
-    ) -> Result<Self> {
+    ) -> Result<(
+        OwnedFd,
+        NonNull<u8>,
+        usize,
+        Child,
+        ChildStdin,
+        BufReader<ChildStdout>,
+    )> {
         let header = ShmBufferHeader::new(width, height);
         let shm_size = header.total_shm_size();
 
-        // Frame buffer in shared memory without CLOEXEC so the child process inherits the FD
+        // Create shared memory frame buffer without CLOEXEC so the child inherits the FD.
         let shm_fd = memfd_create("rwallpprs-shm-framebuf", MemfdFlags::empty())
             .context("rustix::fs::memfd_create failed for the frame buffer")?;
 
         ftruncate(&shm_fd, shm_size as u64)
             .context("rustix::fs::ftruncate failed for the SHM buffer")?;
 
-        // Clear FD_CLOEXEC explicitly on the SHM descriptor we hand over
         let flags = fcntl_getfd(&shm_fd)?;
         fcntl_setfd(&shm_fd, flags.difference(FdFlags::CLOEXEC))?;
 
@@ -144,34 +161,60 @@ impl RustWallpaperRunner {
             std::ptr::write(shm_ptr.as_ptr().cast::<ShmBufferHeader>(), header);
         }
 
-        let mut cmd = Command::new(&exec_path);
-        cmd.args(&args)
+        let mut cmd = Command::new(exec_path);
+        cmd.args(args)
             .env("RWALLPPRS_SHM_FD", shm_fd.as_raw_fd().to_string())
             .env("RWALLPPRS_SHM_SIZE", shm_size.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to launch Rust wallpaper {}", display_name))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe {
+                    let _ = munmap(shm_ptr.as_ptr().cast(), shm_size);
+                }
+                return Err(e)
+                    .with_context(|| format!("Failed to launch Rust wallpaper {}", display_name));
+            }
+        };
 
         let child_stdin = child
             .stdin
             .take()
-            .context("Failed to take the child process stdin")?;
+            .context("Failed to capture child process stdin")?;
         let child_stdout = BufReader::new(
             child
                 .stdout
                 .take()
-                .context("Failed to take the child process stdout")?,
+                .context("Failed to capture child process stdout")?,
         );
 
+        Ok((shm_fd, shm_ptr, shm_size, child, child_stdin, child_stdout))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_internal(
+        display_name: String,
+        exec_path: PathBuf,
+        embedded_elf_fd: Option<OwnedFd>,
+        args: Vec<String>,
+        mode: RustWallpaperMode,
+        target_fps: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let (shm_fd, shm_ptr, shm_size, child, child_stdin, child_stdout) =
+            Self::allocate_shm_and_spawn_child(&display_name, &exec_path, &args, width, height)?;
+
         info!(
-            "Started Rust wallpaper {} (PID={}, mode={:?}, SHM={} KB)",
+            "Started Rust wallpaper {} (PID={}, mode={:?}, {}x{}, SHM={} KB)",
             display_name,
             child.id(),
             mode,
+            width,
+            height,
             shm_size / 1024
         );
 
@@ -187,7 +230,7 @@ impl RustWallpaperRunner {
             shm_fd,
             shm_ptr,
             shm_size,
-            _embedded_elf_fd: embedded_elf_fd,
+            embedded_elf_fd,
             child,
             child_stdin,
             child_stdout,
@@ -197,23 +240,78 @@ impl RustWallpaperRunner {
             last_frame_instant: now,
             suspended: false,
             last_niri_snapshot: None,
+            crash_restarts: 0,
+            last_restart_instant: None,
         })
+    }
+
+    /// Recreates the shared memory double buffer and restarts the wallpaper worker
+    /// for a new monitor resolution while preserving `embedded_elf_fd`.
+    pub fn resize_output(&mut self, new_width: u32, new_height: u32) -> Result<()> {
+        if self.width == new_width && self.height == new_height {
+            return Ok(());
+        }
+        info!(
+            "Resizing Rust wallpaper {} from {}x{} to {}x{}",
+            self.display_name, self.width, self.height, new_width, new_height
+        );
+        self.respawn_with_dimensions(new_width, new_height)?;
+        self.crash_restarts = 0;
+        Ok(())
+    }
+
+    fn respawn_with_dimensions(&mut self, new_width: u32, new_height: u32) -> Result<()> {
+        // Refresh exec_path in case embedded_elf_fd is active.
+        if let Some(ref elf_fd) = self.embedded_elf_fd {
+            self.exec_path = PathBuf::from(format!("/proc/self/fd/{}", elf_fd.as_raw_fd()));
+        }
+
+        let (new_shm_fd, new_shm_ptr, new_shm_size, new_child, new_stdin, new_stdout) =
+            Self::allocate_shm_and_spawn_child(
+                &self.display_name,
+                &self.exec_path,
+                &self.args,
+                new_width,
+                new_height,
+            )?;
+
+        // Terminate the previous child and release the old SHM mapping.
+        let _ = serde_json::to_writer(&mut self.child_stdin, &WorkerEvent::Terminate);
+        let _ = self.child_stdin.write_all(b"\n");
+        let _ = self.child_stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        unsafe {
+            let _ = munmap(self.shm_ptr.as_ptr().cast(), self.shm_size);
+        }
+
+        self.shm_fd = new_shm_fd;
+        self.shm_ptr = new_shm_ptr;
+        self.shm_size = new_shm_size;
+        self.child = new_child;
+        self.child_stdin = new_stdin;
+        self.child_stdout = new_stdout;
+        self.width = new_width;
+        self.height = new_height;
+        self.current_slot = 0;
+        self.frame_index = 0;
+        self.last_frame_instant = Instant::now();
+        self.last_niri_snapshot = None;
+        self.suspended = false;
+
+        Ok(())
     }
 
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    /// Raw FD of the engine frame-buffer `memfd` (zero-copy direct present over the
-    /// same file: the daemon imports it into `wl_shm` without copying pixels).
-    /// The runner always owns this memfd, so the `RawFd` is not optional.
+    /// Raw FD of the worker frame-buffer `memfd` for zero-copy `wl_shm` presentation.
     pub fn shm_raw_fd(&self) -> RawFd {
         self.shm_fd.as_raw_fd()
     }
 
-    /// Slot that will be used for the **next** frame, without advancing
-    /// `current_slot`. Used by main-loop flow control: before sending
-    /// `RenderFrame` it checks whether the compositor released that slot.
+    /// Slot index that will be used for the next frame without advancing `current_slot`.
     pub fn peek_next_slot(&self) -> u8 {
         self.current_slot
     }
@@ -265,16 +363,25 @@ impl RustWallpaperRunner {
         };
         self.frame_index += 1;
 
-        serde_json::to_writer(&mut self.child_stdin, &req)?;
-        self.child_stdin.write_all(b"
-")?;
-        self.child_stdin.flush()?;
+        let io_result = (|| -> Result<String> {
+            serde_json::to_writer(&mut self.child_stdin, &req)?;
+            self.child_stdin.write_all(b"\n")?;
+            self.child_stdin.flush()?;
 
-        let mut line = String::new();
-        self.child_stdout.read_line(&mut line)?;
-        if line.trim().is_empty() {
-            anyhow::bail!("The Rust wallpaper process closed its reply pipe");
-        }
+            let mut line = String::new();
+            self.child_stdout.read_line(&mut line)?;
+            if line.trim().is_empty() {
+                anyhow::bail!("Rust wallpaper worker closed its reply pipe");
+            }
+            Ok(line)
+        })();
+
+        let line = match io_result {
+            Ok(l) => l,
+            Err(err) => {
+                return self.handle_worker_crash(err);
+            }
+        };
 
         let ack: WorkerAck = serde_json::from_str(&line)?;
         match ack {
@@ -285,12 +392,37 @@ impl RustWallpaperRunner {
                 let frame_slice = unsafe {
                     std::slice::from_raw_parts(self.shm_ptr.as_ptr().add(offset), byte_len)
                 };
-                // Return the slot together with the slice: direct present binds the
-                // wl_buffer to this exact offset (zero copy through SHM)
                 Ok(Some((slot, frame_slice)))
             }
             WorkerAck::FrameSkipped { .. } => Ok(None),
         }
+    }
+
+    fn handle_worker_crash(&mut self, err: anyhow::Error) -> Result<Option<(u8, &[u8])>> {
+        if self.crash_restarts >= MAX_CRASH_RESTARTS {
+            self.suspended = true;
+            anyhow::bail!(
+                "Rust wallpaper {} crashed {} times ({}); suspending worker",
+                self.display_name,
+                self.crash_restarts,
+                err
+            );
+        }
+
+        if let Some(last) = self.last_restart_instant {
+            if last.elapsed() < CRASH_RESTART_COOLDOWN {
+                return Ok(None);
+            }
+        }
+
+        self.crash_restarts += 1;
+        self.last_restart_instant = Some(Instant::now());
+        warn!(
+            "Rust wallpaper {} pipe lost ({}); attempting restart {}/{}",
+            self.display_name, err, self.crash_restarts, MAX_CRASH_RESTARTS
+        );
+        self.respawn_with_dimensions(self.width, self.height)?;
+        Ok(None)
     }
 
     pub fn set_suspended(&mut self, suspend: bool) {
@@ -304,8 +436,7 @@ impl RustWallpaperRunner {
             WorkerEvent::Resume
         };
         if serde_json::to_writer(&mut self.child_stdin, &evt).is_ok() {
-            let _ = self.child_stdin.write_all(b"
-");
+            let _ = self.child_stdin.write_all(b"\n");
             let _ = self.child_stdin.flush();
         }
     }
@@ -314,8 +445,7 @@ impl RustWallpaperRunner {
 impl Drop for RustWallpaperRunner {
     fn drop(&mut self) {
         let _ = serde_json::to_writer(&mut self.child_stdin, &WorkerEvent::Terminate);
-        let _ = self.child_stdin.write_all(b"
-");
+        let _ = self.child_stdin.write_all(b"\n");
         let _ = self.child_stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();

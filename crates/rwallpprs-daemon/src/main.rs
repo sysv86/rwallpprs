@@ -11,13 +11,13 @@ use config::DaemonConfig;
 use niri_monitor::NiriMonitor;
 use power_manager::{power_state_hint, PowerManager};
 use rust_runner::RustWallpaperRunner;
-use rwallpprs_ipc::{
-    read_framed_msg, write_framed_msg, ControlCommand, ControlResponse, DaemonStatusReport,
-    OutputStatus, PowerRuntimeState, RustWallpaperMode, ShmBufferHeader,
-};
 use rustix::{
     fd::{AsRawFd, OwnedFd},
     fs::{ftruncate, memfd_create, MemfdFlags},
+};
+use rwallpprs_ipc::{
+    read_framed_msg, write_framed_msg, ControlCommand, ControlResponse, DaemonStatusReport,
+    OutputStatus, PowerRuntimeState, RustWallpaperMode, ShmBufferHeader,
 };
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -27,7 +27,10 @@ use video_engine::VideoWallpaperEngine;
 use wayland_layer::WaylandLayerContext;
 
 #[derive(Parser, Debug)]
-#[command(name = "rwallpprs-daemon", about = "RWallpprs v0.2.0-beta.1 Wayland daemon for Niri")]
+#[command(
+    name = "rwallpprs-daemon",
+    about = "RWallpprs v0.2.0-beta.2 Wayland daemon for Niri"
+)]
 struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
@@ -39,9 +42,7 @@ enum ActiveEngine {
     RustBin(RustWallpaperRunner),
 }
 
-/// Daemon memfd for the zero-copy direct present of the video engine: the daemon
-/// owns the SHM ring itself (the ffmpeg decoder writes frames straight into memory
-/// the compositor displays through `DirectShmPresent`).
+/// Daemon memfd for zero-copy direct presentation of the video engine.
 struct VideoDirectRing {
     shm_fd: OwnedFd,
     width: u32,
@@ -50,8 +51,6 @@ struct VideoDirectRing {
 
 impl VideoDirectRing {
     fn new(width: u32, height: u32) -> anyhow::Result<Self> {
-        // CLOEXEC is safe here: the ring is never handed to another process (no exec'd
-        // children); it is the daemon SHM backing the compositor wl_shm pool
         let shm_fd = memfd_create("rwallpprs-video-direct", MemfdFlags::CLOEXEC)
             .context("rustix::fs::memfd_create failed for the video SHM ring")?;
         ftruncate(
@@ -66,7 +65,6 @@ impl VideoDirectRing {
         })
     }
 
-    /// Whether the ring matches the current monitor resolution
     fn fits(&self, width: u32, height: u32) -> bool {
         self.width == width && self.height == height
     }
@@ -77,9 +75,22 @@ pub fn control_socket_path() -> PathBuf {
     PathBuf::from(runtime_dir).join("rwallpprs.sock")
 }
 
-/// Minimum number of main-loop ticks between retries of the video direct presenter
-/// (backoff retry instead of hammering it every frame).
+/// Minimum number of main-loop ticks between retries of the video direct presenter.
 const VIDEO_DIRECT_RETRY_TICKS: u32 = 30;
+
+fn resize_active_engine(active_engine: &mut ActiveEngine, width: u32, height: u32) {
+    match active_engine {
+        ActiveEngine::Video(ref mut video) => {
+            video.resize_output(width, height);
+        }
+        ActiveEngine::RustBin(ref mut runner) => {
+            if let Err(e) = runner.resize_output(width, height) {
+                error!("Failed to resize Rust wallpaper runner to {}x{}: {}", width, height, e);
+            }
+        }
+        ActiveEngine::None => {}
+    }
+}
 
 pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -89,16 +100,13 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         )
         .init();
 
-    // A panic that unwinds out of the main loop kills the whole session and leaves a
-    // stale socket behind, which looks exactly like "the wallpaper stopped working".
-    // Log it with a backtrace so the cause is recoverable from the logs.
     std::panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
         error!("PANIC in rwallpprs-daemon: {info}\n{backtrace}");
     }));
 
     let cfg = DaemonConfig::load_or_default(config_path.as_deref())?;
-    info!("Starting RWallpprs v0.2.0-beta.1 daemon under the Niri compositor...");
+    info!("Starting RWallpprs v0.2.0-beta.2 daemon under the Niri compositor...");
 
     let sock_path = control_socket_path();
     if sock_path.exists() {
@@ -135,23 +143,21 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let mut active_engine = ActiveEngine::None;
     let mut first_frame_rendered = false;
     let mut frame_scratch: Vec<u8> = Vec::new();
-    // Zero-copy direct present for video: daemon memfd ring with alternating slot 0/1
     let mut video_direct_ring: Option<VideoDirectRing> = None;
-    // Retry backoff for the video direct presenter init: ticks until the next attempt
     let mut video_direct_backoff: u32 = 0;
     let mut video_slot: u8 = 0;
     let mut running = true;
-    // Last suppression reason, so a state change is logged once instead of every tick
     let mut last_power_reason: Option<String> = None;
 
     while running {
         let frame_start = Instant::now();
 
-        // 1. Accept commands from the CLI (including streamed upload of an embedded ELF binary)
+        // 1. Accept commands from the CLI
         while let Ok((stream, _)) = listener.accept() {
             let _ = stream.set_nonblocking(false);
             if let Err(e) = handle_cli_client(
                 stream,
+                &cfg,
                 &mut active_engine,
                 &mut power_mgr,
                 &niri_monitor,
@@ -166,20 +172,14 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         // 2. Dispatch Wayland events and detect monitor resolution changes
         let mut wl_dead = false;
         if let Some((ref conn, ref mut queue, ref mut wl_ctx)) = wayland_session {
-            // roundtrip reads incoming compositor replies (including wl_buffer.release);
-            // without it SlotPool never frees slots and memory grows until the session OOMs
             let _ = conn.flush();
             if let Err(e) = queue.roundtrip(wl_ctx) {
-                // Fatal protocol error (client detached by the compositor):
-                // reinitialize the whole Wayland session on the next tick
                 error!("Wayland connection lost ({}), reconnect scheduled", e);
                 wl_dead = true;
             } else if wl_ctx.resolution_changed {
                 wl_ctx.resolution_changed = false;
                 niri_monitor.set_output_dimensions(wl_ctx.width, wl_ctx.height);
-                if let ActiveEngine::Video(ref mut video) = active_engine {
-                    video.resize_output(wl_ctx.width, wl_ctx.height);
-                }
+                resize_active_engine(&mut active_engine, wl_ctx.width, wl_ctx.height);
                 first_frame_rendered = false;
             }
         }
@@ -194,6 +194,7 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                         ctx.width, ctx.height
                     );
                     niri_monitor.set_output_dimensions(ctx.width, ctx.height);
+                    resize_active_engine(&mut active_engine, ctx.width, ctx.height);
                     first_frame_rendered = false;
                     wayland_session = Some((conn, queue, ctx));
                 }
@@ -224,12 +225,6 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                     ActiveEngine::None => {}
                 }
                 if power_mgr.policy.auto_hide_surface {
-                    // The surface is deliberately NOT detached (attach(None)): in
-                    // zwlr-layer-shell, detaching the buffer while L/R+T/B anchors
-                    // are set makes Niri raise the protocol error "width 0 requested
-                    // without setting left and right anchors" and kills the layer for
-                    // good. A fullscreen window already covers the background, and
-                    // the last frame is a valid wallpaper state; engines stay paused.
                     if let Some((_, _, ref mut wl_ctx)) = wayland_session {
                         wl_ctx.mark_hidden_for_powersave();
                     }
@@ -259,25 +254,14 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         let target_fps = match &mut active_engine {
             ActiveEngine::None => 15,
             ActiveEngine::Video(video) => {
-                // --- Zero-copy direct present: ffmpeg writes the frame straight into the memfd ---
-                // `direct_path_used` => this tick was handled by the direct path (frame shown
-                // or deliberately dropped by flow control), so the copying fallback is not needed
                 let mut direct_path_used = false;
 
                 if let Some((_, ref queue, ref mut wl_ctx)) = wayland_session {
-                    // Keep the direct presenter consistent with the current video ring:
-                    // after an engine switch (SetVideo/SetRustBin/SetEmbeddedBin) a stale
-                    // presenter would otherwise keep handing the compositor buffers from
-                    // someone else's memfd. No ring at all means any existing direct is foreign.
                     let ring_src = video_direct_ring
                         .as_ref()
                         .map(|ring| (ring.shm_fd.as_raw_fd(), ring.width, ring.height));
                     wl_ctx.reset_direct_if_stale(ring_src);
 
-                    // Lazy bring-up of the ring and direct presenter, recreated after a
-                    // resolution change (configure resets direct). On failure, retry with
-                    // backoff: the memfd ring is reused rather than discarded and warn-spammed
-                    // on every frame.
                     if video_direct_backoff > 0 {
                         video_direct_backoff -= 1;
                     } else if wl_ctx.direct.is_none()
@@ -295,7 +279,7 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                                 Err(e) => {
                                     video_direct_backoff = VIDEO_DIRECT_RETRY_TICKS;
                                     warn!(
-                                        "Failed to create the daemon video SHM memfd: {}. Retrying in {} ticks; fallback: copy through present_frame",
+                                        "Failed to create daemon video SHM memfd: {}. Retrying in {} ticks; fallback: copy through present_frame",
                                         e, VIDEO_DIRECT_RETRY_TICKS
                                     );
                                 }
@@ -304,8 +288,6 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                         if video_direct_backoff == 0 {
                             if let Some(ring) = video_direct_ring.as_ref() {
                                 let qh = queue.handle();
-                                // write_header=true: the daemon memfd gets its header only
-                                // here, when the presenter is initialized
                                 match wl_ctx.init_direct_shm(
                                     &qh,
                                     ring.shm_fd.as_raw_fd(),
@@ -314,8 +296,6 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                                     true,
                                 ) {
                                     Err(e) => {
-                                        // The ring is alive (the memfd is reused), so only
-                                        // reset the presenter and wait out the backoff
                                         video_direct_backoff = VIDEO_DIRECT_RETRY_TICKS;
                                         warn!(
                                             "Video direct present not brought up: {}. Retrying in {} ticks; fallback: copy through present_frame",
@@ -333,17 +313,11 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                         }
                     }
 
-                    // Flow control BEFORE decoding: if the next ring slot is still held by
-                    // the compositor (no release yet) there is nowhere to decode into, so
-                    // drop the tick honestly: no wasted ffmpeg frame and no overwriting a
-                    // buffer the compositor might still be reading.
                     let next_slot = video_slot ^ 1;
                     if wl_ctx.direct_slot_free(next_slot) {
-                        // Alternate slots 0/1 (like current_slot in the Rust runner)
                         video_slot ^= 1;
                         let slot = video_slot as usize;
 
-                        // Decode with ffmpeg straight into the memfd slot — no intermediate buffers
                         if let Some(slot_slice) = wl_ctx.direct_slot_slice(slot) {
                             match video.decode_next_frame(slot_slice) {
                                 Ok(true) => match wl_ctx.present_shm_slot(slot) {
@@ -351,31 +325,23 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                                         first_frame_rendered = true;
                                         direct_path_used = true;
                                     }
-                                    Ok(false) => {
-                                        // Honest drop: the frame is already written into the ring
-                                        // slot but attach failed, and it cannot be repeated, so
-                                        // there is no recovery until the next iteration
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        error!("Zero-copy present of video frame failed: {}", e)
                                     }
-                                    Err(e) => error!("Zero-copy present of the video frame failed: {}", e),
                                 },
                                 Ok(false) => {}
                                 Err(e) => {
-                                    // Do not re-render the frame through the fallback on a direct
-                                    // decode error (that would run the decoder twice); the next
-                                    // tick will try again.
                                     direct_path_used = true;
-                                    error!("Failed to decode a frame into the direct SHM: {}", e);
+                                    error!("Failed to decode frame into direct SHM: {}", e);
                                 }
                             }
                         }
                     } else {
-                        // Slot busy: the tick is skipped without decoding, so no ffmpeg frame
-                        // is wasted and no fallback is started
                         direct_path_used = true;
                     }
                 }
 
-                // --- Fallback: the older path with a scratch buffer copied into the SlotPool ---
                 if !direct_path_used {
                     let needed = (video.width as usize) * (video.height as usize) * 4;
                     if frame_scratch.len() != needed {
@@ -385,7 +351,7 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                         Ok(true) => {
                             if let Some((_, _, ref mut wl_ctx)) = wayland_session {
                                 if let Err(e) = wl_ctx.present_frame(&frame_scratch) {
-                                    error!("Failed to present the video frame on Wayland: {}", e);
+                                    error!("Failed to present video frame on Wayland: {}", e);
                                 }
                             }
                             first_frame_rendered = true;
@@ -398,21 +364,12 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             }
             ActiveEngine::RustBin(runner) => {
                 let fps = runner.target_fps;
-                // Runner memfd parameters are fixed at spawn time, so capture them
-                // before the borrowed request_frame (the frame slice holds the mutable borrow)
                 let runner_dims = (runner.width, runner.height);
                 let direct_fd = runner.shm_raw_fd();
 
-                // Keep direct consistent with the runner memfd: after an engine switch a
-                // stale presenter (foreign memfd, possibly even under a reused fd number —
-                // identity is verified) is reset
                 if let Some((_, _, ref mut wl_ctx)) = wayland_session {
                     wl_ctx.reset_direct_if_stale(Some((direct_fd, runner_dims.0, runner_dims.1)));
 
-                    // Flow control: the slot the runner will use for its next frame must
-                    // already have been reclaimed by the compositor. Otherwise RenderFrame
-                    // would overwrite a buffer the compositor is still reading. The runner
-                    // current_slot is NOT advanced: request_frame is not called this tick.
                     if !wl_ctx.direct_slot_free(runner.peek_next_slot()) {
                         let frame_budget = Duration::from_secs_f64(1.0 / (fps.max(1) as f64));
                         let elapsed = frame_start.elapsed();
@@ -426,15 +383,16 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                 match runner.request_frame(niri_state) {
                     Ok(Some((slot, frame_bytes))) => {
                         if let Some((_, ref queue, ref mut wl_ctx)) = wayland_session {
-                            // Zero-copy direct present over the Rust wallpaper memfd itself:
-                            // brought up lazily on the first FrameReady
-                            if wl_ctx.direct.is_none() && runner_dims == (wl_ctx.width, wl_ctx.height)
+                            if wl_ctx.direct.is_none()
+                                && runner_dims == (wl_ctx.width, wl_ctx.height)
                             {
                                 let qh = queue.handle();
-                                // write_header=false: the memfd header was already written by
-                                // spawn_internal when the runner started
                                 if let Err(e) = wl_ctx.init_direct_shm(
-                                    &qh, direct_fd, runner_dims.0, runner_dims.1, false,
+                                    &qh,
+                                    direct_fd,
+                                    runner_dims.0,
+                                    runner_dims.1,
+                                    false,
                                 ) {
                                     warn!(
                                         "Rust wallpaper direct present not brought up: {}. Fallback: copy through present_frame",
@@ -442,27 +400,32 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                                     );
                                 } else {
                                     info!(
-                                        "Zero-copy direct present activated over the Rust wallpaper memfd ({}x{})",
+                                        "Zero-copy direct present activated over Rust wallpaper memfd ({}x{})",
                                         runner_dims.0, runner_dims.1
                                     );
                                 }
                             }
 
-                            // Attach the slot the engine just rendered into, directly
                             match wl_ctx.present_shm_slot(slot as usize) {
                                 Ok(true) => {}
                                 Ok(false) => {
-                                    // Slot held by the server (no release yet): fall back to
-                                    // copying so the frame is not lost
                                     if let Err(e) = wl_ctx.present_frame(frame_bytes) {
-                                        error!("Failed to present the Rust wallpaper frame on Wayland: {}", e);
+                                        error!(
+                                            "Failed to present Rust wallpaper frame on Wayland: {}",
+                                            e
+                                        );
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Zero-copy present of the Rust wallpaper frame failed: {}", e);
-                                    // Fallback: the older copying path through SlotPool
+                                    error!(
+                                        "Zero-copy present of Rust wallpaper frame failed: {}",
+                                        e
+                                    );
                                     if let Err(e) = wl_ctx.present_frame(frame_bytes) {
-                                        error!("Failed to present the Rust wallpaper frame on Wayland: {}", e);
+                                        error!(
+                                            "Failed to present Rust wallpaper frame on Wayland: {}",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -470,7 +433,7 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                         first_frame_rendered = true;
                     }
                     Ok(None) => {}
-                    Err(e) => error!("Failed to obtain a frame from the Rust wallpaper: {}", e),
+                    Err(e) => error!("Failed to obtain a frame from Rust wallpaper: {}", e),
                 }
                 fps
             }
@@ -488,8 +451,10 @@ pub fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_cli_client(
     mut stream: UnixStream,
+    cfg: &DaemonConfig,
     active_engine: &mut ActiveEngine,
     power_mgr: &mut PowerManager,
     niri_monitor: &NiriMonitor,
@@ -514,8 +479,16 @@ fn handle_cli_client(
             fps_limit,
             scale,
             ..
-        } => match VideoWallpaperEngine::new(path.clone(), hw_accel, scale, fps_limit, width, height)
-        {
+        } => match VideoWallpaperEngine::new(
+            path.clone(),
+            hw_accel,
+            scale,
+            fps_limit,
+            width,
+            height,
+            cfg.video.drm_render_node.clone(),
+            cfg.video.loop_playback,
+        ) {
             Ok(engine) => {
                 let codec = engine.codec;
                 *active_engine = ActiveEngine::Video(engine);
@@ -529,7 +502,12 @@ fn handle_cli_client(
                         width,
                         height,
                         fps_limit,
-                        power_note(power_mgr, niri_monitor, RustWallpaperMode::Animated, *first_frame_rendered)
+                        power_note(
+                            power_mgr,
+                            niri_monitor,
+                            RustWallpaperMode::Animated,
+                            *first_frame_rendered
+                        )
                     ),
                 }
             }
@@ -594,7 +572,7 @@ fn handle_cli_client(
                 *first_frame_rendered = false;
                 ControlResponse::Ok {
                     message: format!(
-                        "Embedded binary '{}' ({} KB) loaded into a persistent daemon memfd and started (PID={}, mode={:?}){}",
+                        "Embedded binary '{}' ({} KB) loaded into persistent daemon memfd and started (PID={}, mode={:?}){}",
                         name,
                         elf_payload.len() / 1024,
                         pid,
@@ -635,20 +613,27 @@ fn handle_cli_client(
                 ),
             };
             let power_state = power_mgr.evaluate(&niri_state, mode, *first_frame_rendered);
+            let outputs = wayland_session
+                .as_ref()
+                .map(|(_, _, ctx)| ctx.query_outputs(surface_visible, current_fps))
+                .unwrap_or_else(|| {
+                    vec![OutputStatus {
+                        name: "Niri-Primary-Output".into(),
+                        width,
+                        height,
+                        refresh_mhz: 60_000,
+                        surface_visible,
+                        current_fps,
+                    }]
+                });
+
             ControlResponse::Status(DaemonStatusReport {
                 pid: std::process::id(),
                 niri_socket_connected: niri_monitor.is_connected(),
                 active_source: source_desc,
                 power_state,
                 policy: power_mgr.policy.clone(),
-                outputs: vec![OutputStatus {
-                    name: "Niri-Primary-Output".into(),
-                    width,
-                    height,
-                    refresh_mhz: 60_000,
-                    surface_visible,
-                    current_fps,
-                }],
+                outputs,
                 niri_state,
             })
         }
@@ -664,8 +649,6 @@ fn handle_cli_client(
     Ok(())
 }
 
-/// Logs each transition between rendering and suppressed, so a paused wallpaper is
-/// never mistaken for a crashed one.
 fn log_power_transition(last_reason: &mut Option<String>, state: &PowerRuntimeState) {
     let signature = match state {
         PowerRuntimeState::ActiveRendering => None,
@@ -683,7 +666,6 @@ fn log_power_transition(last_reason: &mut Option<String>, state: &PowerRuntimeSt
     *last_reason = signature;
 }
 
-/// Suffix for a start-up reply explaining that the wallpaper begins in a suppressed state.
 fn power_note(
     power_mgr: &mut PowerManager,
     niri_monitor: &NiriMonitor,
