@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "minimal-arch-static"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "rwallpprs-sdk",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "niri-cyber-grid"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "rwallpprs-sdk",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "niri-voronoi-flow"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "rwallpprs-sdk",
@@ -1129,7 +1129,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rwallpprs-cli"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "rwallpprs-daemon"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "rwallpprs-ipc"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "bincode",
  "serde",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "rwallpprs-sdk"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "anyhow",
  "bytemuck",

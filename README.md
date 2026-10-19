@@ -1,4 +1,4 @@
-# RWallpprs `v0.2.0-beta.1` — Video and Native Rust Wallpapers for Niri (Arch Linux)
+# RWallpprs `v0.2.0-beta.2` — Video and Native Rust Wallpapers for Niri (Arch Linux)
 
 **RWallpprs** is a live and procedural wallpaper engine for the scrollable-tiling Wayland compositor
 **Niri**, built for **Arch Linux**.
@@ -153,6 +153,10 @@ Environment variables:
 - `RUST_LOG` — tracing filter, for example `RUST_LOG=debug` or `RUST_LOG=rwallpprs_daemon=trace`.
 - `NIRI_SOCKET` — required for compositor events; without it the wallpaper still renders, but does
   not react to scrolling or Overview.
+- `RWALLPPRS_GPU_BACKEND` — GPU backend selection for `wgpu` wallpapers (`vulkan`, `gl`, or `auto`).
+- `RWALLPPRS_GPU_POWER` — adapter power preference (`low` default, or `high` for discrete GPUs).
+- `RWALLPPRS_GPU_SYNC_READBACK` — set to `1` to force single-buffer synchronous GPU readback.
+- `RWALLPPRS_GPU_VALIDATION` — set to `1` to enable `wgpu` validation layers for shader debugging.
 
 ## Niri integration
 

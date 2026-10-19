@@ -1,6 +1,6 @@
 # Maintainer: kerneldroid <212222389+kerneldroid@users.noreply.github.com>
 pkgname=rwallpprs
-pkgver=0.2.0_beta.1
+pkgver=0.2.0_beta.2
 pkgrel=1
 pkgdesc="Native Rust Video (ffmpeg-next VA-API/Vulkan H.264/HEVC/AV1) & GPU/CPU Wallpaper Engine for Niri"
 arch=('x86_64')

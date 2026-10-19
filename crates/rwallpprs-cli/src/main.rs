@@ -1,4 +1,4 @@
-//! `rwallpprs` CLI utility (`v0.2.0-beta.1`).
+//! `rwallpprs` CLI utility (`v0.2.0-beta.2`).
 //!
 //! When run as `rwallpprs run-embedded`, it extracts the wallpaper ELF image
 //! embedded at the end of its own file and hands it over a framed socket to
@@ -385,7 +385,7 @@ fn print_response(resp: ControlResponse) {
         ControlResponse::Ok { message } => println!("[OK] {}", message),
         ControlResponse::Error { reason } => eprintln!("[ERROR] {}", reason),
         ControlResponse::Status(st) => {
-            println!("=== RWallpprs v0.2.0-beta.1 Daemon Status (Niri) ===");
+            println!("=== RWallpprs v0.2.0-beta.2 Daemon Status (Niri) ===");
             println!("Daemon PID          : {}", st.pid);
             println!("NIRI_SOCKET active  : {}", st.niri_socket_connected);
             println!("Active source       : {}", st.active_source);
