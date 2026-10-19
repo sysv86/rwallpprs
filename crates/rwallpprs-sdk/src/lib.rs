@@ -1,20 +1,22 @@
-//! # RWallpprs SDK (`v0.2.0-beta.1`)
+//! # RWallpprs SDK (`v0.2.0-beta.2`)
 //!
-//! Purpose-built API for writing wallpapers for the **Niri** compositor in plain **Rust**:
-//! - **On the GPU (`wgpu` + WGSL shaders)**: through the [`GpuShaderWallpaper`] trait and the [`run_shader_wallpaper!`] macro.
-//! - **On the GPU (full 2D scenes)**: through the [`GpuSceneWallpaper`] trait, the [`GpuScene`] context
-//!   and the [`run_scene_wallpaper!`] macro — custom pipelines, buffers, instancing.
-//! - **On the CPU (`Canvas`, zero-copy SHM)**: through the [`Wallpaper`] trait and the [`run_wallpaper!`] macro.
-//! - All shared memory operations (`RWALLPPRS_SHM_FD`) use the safe [`rustix::mm::mmap`] wrappers.
+//! Purpose-built API for authoring live and procedural wallpapers for the **Niri** compositor in **Rust**:
+//! - **On the GPU (`wgpu` + WGSL shaders)**: via [`GpuShaderWallpaper`] and [`run_shader_wallpaper!`].
+//! - **On the GPU (full 2D/3D scenes)**: via [`GpuSceneWallpaper`], [`GpuScene`], and [`run_scene_wallpaper!`]
+//!   for custom pipelines, instanced geometry, and multi-pass rendering.
+//! - **On the CPU (`Canvas`, zero-copy SHM)**: via [`Wallpaper`] and [`run_wallpaper!`].
+//! - All shared memory operations (`RWALLPPRS_SHM_FD`) use safe [`rustix::mm::mmap`] wrappers with
+//!   strict bounds verification.
 
 pub mod wgpu_renderer;
 
 pub use rwallpprs_ipc::{NiriViewportState, RustWallpaperMode, WorkerAck, WorkerEvent};
 pub use wgpu_renderer::{
     GpuScene, GpuSceneWallpaper, GpuShaderWallpaper, NiriShaderUniforms, SceneWallpaperAdapter,
-    ShaderWallpaperAdapter, WgpuHeadlessPipeline, SCENE_TARGET_FORMAT,
+    ShaderWallpaperAdapter, WgpuCore, WgpuHeadlessPipeline, WgpuScenePipeline, SCENE_TARGET_FORMAT,
 };
 
+use bytemuck::{Pod, Zeroable};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{BorrowedFd, RawFd};
@@ -22,7 +24,7 @@ use std::ptr::NonNull;
 
 /// Pixel color in Wayland `ARGB8888` / `XRGB8888` layout (little-endian: `[B, G, R, A]`).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Pod, Zeroable)]
 pub struct Color {
     pub b: u8,
     pub g: u8,
@@ -70,9 +72,19 @@ impl Color {
             | ((self.g as u32) << 8)
             | (self.b as u32)
     }
+
+    #[inline(always)]
+    pub const fn from_u32_argb(px: u32) -> Self {
+        Self {
+            b: (px & 0xFF) as u8,
+            g: ((px >> 8) & 0xFF) as u8,
+            r: ((px >> 16) & 0xFF) as u8,
+            a: ((px >> 24) & 0xFF) as u8,
+        }
+    }
 }
 
-/// Frame context passed to `Wallpaper::render`.
+/// Per-frame timing, resolution, and Niri compositor state passed to `Wallpaper::render`.
 #[derive(Debug, Clone)]
 pub struct FrameContext {
     pub frame_index: u64,
@@ -83,7 +95,7 @@ pub struct FrameContext {
     pub niri: NiriViewportState,
 }
 
-/// Fast drawing surface (`Canvas`) pointing straight into a mapped Wayland shared memory region (`wl_shm`).
+/// Fast drawing surface (`Canvas`) pointing directly into a mapped Wayland shared memory slot (`wl_shm`).
 pub struct Canvas<'a> {
     pub width: u32,
     pub height: u32,
@@ -118,6 +130,15 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    #[inline(always)]
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, coverage: f32) {
+        if x >= 0 && y >= 0 && (x as u32) < self.width && (y as u32) < self.height {
+            let idx = (y as usize) * (self.width as usize) + (x as usize);
+            let bg = Color::from_u32_argb(self.pixels[idx]);
+            self.pixels[idx] = bg.lerp(color, coverage).to_u32_argb();
+        }
+    }
+
     pub fn fill_vertical_gradient(&mut self, top: Color, bottom: Color) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -129,45 +150,113 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Clips a segment to the canvas bounds using Liang-Barsky before rasterizing with Bresenham.
+    /// Prevents pathological CPU loops when endpoints lie far outside the viewport at high zoom.
     pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
-        let mut x0 = x0;
-        let mut y0 = y0;
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        let max_x = (self.width as i32 - 1) as f32;
+        let max_y = (self.height as i32 - 1) as f32;
+
+        let (mut fx0, mut fy0) = (x0 as f32, y0 as f32);
+        let (fx1, fy1) = (x1 as f32, y1 as f32);
+        let dx = fx1 - fx0;
+        let dy = fy1 - fy0;
+
+        let p = [-dx, dx, -dy, dy];
+        let q = [fx0, max_x - fx0, fy0, max_y - fy0];
+        let mut u1 = 0.0f32;
+        let mut u2 = 1.0f32;
+
+        for i in 0..4 {
+            if p[i].abs() < 1e-6 {
+                if q[i] < 0.0 {
+                    return;
+                }
+            } else {
+                let t = q[i] / p[i];
+                if p[i] < 0.0 {
+                    if t > u2 {
+                        return;
+                    }
+                    if t > u1 {
+                        u1 = t;
+                    }
+                } else {
+                    if t < u1 {
+                        return;
+                    }
+                    if t < u2 {
+                        u2 = t;
+                    }
+                }
+            }
+        }
+
+        let cx0 = (fx0 + u1 * dx).round() as i32;
+        let cy0 = (fy0 + u1 * dy).round() as i32;
+        let cx1 = (fx0 + u2 * dx).round() as i32;
+        let cy1 = (fy0 + u2 * dy).round() as i32;
+
+        fx0 = cx0 as f32;
+        fy0 = cy0 as f32;
+        let mut ix0 = fx0 as i32;
+        let mut iy0 = fy0 as i32;
+        let bdx = (cx1 - ix0).abs();
+        let sx = if ix0 < cx1 { 1 } else { -1 };
+        let bdy = -(cy1 - iy0).abs();
+        let sy = if iy0 < cy1 { 1 } else { -1 };
+        let mut err = bdx + bdy;
 
         loop {
-            self.set_pixel(x0, y0, color);
-            if x0 == x1 && y0 == y1 {
+            self.set_pixel(ix0, iy0, color);
+            if ix0 == cx1 && iy0 == cy1 {
                 break;
             }
             let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
+            if e2 >= bdy {
+                err += bdy;
+                ix0 += sx;
             }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
+            if e2 <= bdx {
+                err += bdx;
+                iy0 += sy;
             }
         }
     }
 
+    /// Fills a circle using squared-distance inner rejection so `.sqrt()` is only evaluated
+    /// along the 1-pixel antialiased perimeter band.
     pub fn fill_circle_sdf(&mut self, cx: f32, cy: f32, radius: f32, color: Color) {
+        if radius <= 0.0 || self.width == 0 || self.height == 0 {
+            return;
+        }
         let min_x = ((cx - radius - 1.0).floor() as i32).max(0);
         let max_x = ((cx + radius + 1.0).ceil() as i32).min(self.width as i32 - 1);
         let min_y = ((cy - radius - 1.0).floor() as i32).max(0);
         let max_y = ((cy + radius + 1.0).ceil() as i32).min(self.height as i32 - 1);
 
+        let r_inner = (radius - 0.5).max(0.0);
+        let r_outer = radius + 0.5;
+        let r_inner_sq = r_inner * r_inner;
+        let r_outer_sq = r_outer * r_outer;
+        let argb = color.to_u32_argb();
+        let w = self.width as usize;
+
         for y in min_y..=max_y {
+            let dy = y as f32 - cy;
+            let dy_sq = dy * dy;
+            let row_off = (y as usize) * w;
             for x in min_x..=max_x {
                 let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist <= radius {
-                    self.set_pixel(x, y, color);
+                let dist_sq = dx * dx + dy_sq;
+                if dist_sq <= r_inner_sq {
+                    self.pixels[row_off + (x as usize)] = argb;
+                } else if dist_sq < r_outer_sq {
+                    let dist = dist_sq.sqrt();
+                    let cov = (r_outer - dist).clamp(0.0, 1.0);
+                    self.blend_pixel(x, y, color, cov);
                 }
             }
         }
@@ -193,7 +282,7 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Main trait for CPU/hybrid Rust wallpapers.
+/// Core trait for CPU and hybrid Rust wallpapers.
 pub trait Wallpaper: Sized + 'static {
     fn init(args: &[String]) -> Self;
 
@@ -207,7 +296,7 @@ pub trait Wallpaper: Sized + 'static {
     fn render(&mut self, ctx: &FrameContext, canvas: &mut Canvas<'_>) -> bool;
 }
 
-/// RAII wrapper around `rustix::mm::mmap` guaranteeing an automatic `munmap` on drop.
+/// RAII wrapper around `rustix::mm::mmap` that unmaps the shared memory region on drop.
 struct MappedShmRegion {
     ptr: NonNull<u8>,
     size: usize,
@@ -231,9 +320,16 @@ impl MappedShmRegion {
         Ok(Self { ptr, size })
     }
 
-    unsafe fn slot_slice_mut(&mut self, offset: usize, pixel_count: usize) -> &mut [u32] {
+    /// Returns a mutable slice of `u32` pixels for the given byte offset and pixel count,
+    /// or `None` if the requested region exceeds the mapped shared memory size.
+    unsafe fn slot_slice_mut(&mut self, offset: usize, pixel_count: usize) -> Option<&mut [u32]> {
+        let byte_len = pixel_count.checked_mul(std::mem::size_of::<u32>())?;
+        let end = offset.checked_add(byte_len)?;
+        if end > self.size {
+            return None;
+        }
         let slot_ptr = self.ptr.as_ptr().add(offset).cast::<u32>();
-        std::slice::from_raw_parts_mut(slot_ptr, pixel_count)
+        Some(std::slice::from_raw_parts_mut(slot_ptr, pixel_count))
     }
 }
 
@@ -245,7 +341,7 @@ impl Drop for MappedShmRegion {
     }
 }
 
-/// Runs the Rust wallpaper lifecycle loop.
+/// Runs the Rust wallpaper worker event loop.
 pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut wallpaper = W::init(&args);
@@ -306,31 +402,40 @@ pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
                 let offset = header.slot_offset(slot);
                 let pixel_count = (width as usize) * (height as usize);
 
-                let slice = unsafe { shm_region.slot_slice_mut(offset, pixel_count) };
-                let mut canvas = Canvas::from_raw_slice(width, height, slice);
-                let ctx = FrameContext {
-                    frame_index,
-                    time_secs,
-                    dt_secs,
-                    width,
-                    height,
-                    niri,
-                };
+                let ack = match unsafe { shm_region.slot_slice_mut(offset, pixel_count) } {
+                    Some(slice) => {
+                        let mut canvas = Canvas::from_raw_slice(width, height, slice);
+                        let ctx = FrameContext {
+                            frame_index,
+                            time_secs,
+                            dt_secs,
+                            width,
+                            height,
+                            niri,
+                        };
 
-                let changed = wallpaper.render(&ctx, &mut canvas);
-                let ack = if changed {
-                    WorkerAck::FrameReady {
-                        slot,
-                        frame_index,
-                        damaged_rect: Some((0, 0, width, height)),
+                        let changed = wallpaper.render(&ctx, &mut canvas);
+                        if changed {
+                            WorkerAck::FrameReady {
+                                slot,
+                                frame_index,
+                                damaged_rect: Some((0, 0, width, height)),
+                            }
+                        } else {
+                            WorkerAck::FrameSkipped { frame_index }
+                        }
                     }
-                } else {
-                    WorkerAck::FrameSkipped { frame_index }
+                    None => {
+                        eprintln!(
+                            "[rwallpprs-sdk] SHM buffer ({} bytes) is smaller than requested {}x{} slot; skipping frame {}",
+                            shm_region.size, width, height, frame_index
+                        );
+                        WorkerAck::FrameSkipped { frame_index }
+                    }
                 };
 
                 serde_json::to_writer(&mut stdout, &ack)?;
-                stdout.write_all(b"
-")?;
+                stdout.write_all(b"\n")?;
                 stdout.flush()?;
             }
             WorkerEvent::Suspend => wallpaper.on_suspend(),
@@ -342,7 +447,7 @@ pub fn run_wallpaper_loop<W: Wallpaper>() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Macro that runs a CPU/hybrid wallpaper implementing [`Wallpaper`].
+/// Macro that launches a CPU/hybrid wallpaper implementing [`Wallpaper`].
 #[macro_export]
 macro_rules! run_wallpaper {
     ($wallpaper_type:ty) => {
@@ -352,7 +457,7 @@ macro_rules! run_wallpaper {
     };
 }
 
-/// Macro that runs a hardware WGPU/WGSL shader wallpaper implementing [`GpuShaderWallpaper`].
+/// Macro that launches a hardware WGPU/WGSL shader wallpaper implementing [`GpuShaderWallpaper`].
 #[macro_export]
 macro_rules! run_shader_wallpaper {
     ($shader_wallpaper_type:ty) => {
@@ -362,10 +467,10 @@ macro_rules! run_shader_wallpaper {
     };
 }
 
-/// Macro that runs a scene WGPU wallpaper implementing [`GpuSceneWallpaper`].
+/// Macro that launches a scene WGPU wallpaper implementing [`GpuSceneWallpaper`].
 ///
-/// Gives the wallpaper full `wgpu::Device` / `Queue` / `CommandEncoder` access for its own
-/// pipelines, buffers and instancing, and reads the finished frame back into a [`Canvas`] automatically.
+/// Gives the wallpaper full `wgpu::Device` / `Queue` / `CommandEncoder` access for custom
+/// pipelines, buffers, and instancing, and reads finished frames back into [`Canvas`] automatically.
 #[macro_export]
 macro_rules! run_scene_wallpaper {
     ($scene_wallpaper_type:ty) => {
